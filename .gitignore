@@ -1,0 +1,65 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environment ────────────────────────────────────────────────────────
+venv/
+env/
+.venv/
+ENV/
+
+# ── Jupyter ────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Generated dataset (run data_preparation.py to regenerate) ─────────────────
+dataset/
+
+# ── Trained model weights ─────────────────────────────────────────────────────
+*.h5
+*.keras
+*.pt
+*.pth
+*.tflite
+*.onnx
+models/
+tflite/
+
+# ── TensorBoard logs ──────────────────────────────────────────────────────────
+logs/
+
+# ── Training output plots ─────────────────────────────────────────────────────
+*_training_history.png
+*_confusion_matrix.png
+
+# ── Test output images (keep source test image) ───────────────────────────────
+images/test_result.png
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+
+# ── IDEs ──────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.log
+.env
+detection_results.json
