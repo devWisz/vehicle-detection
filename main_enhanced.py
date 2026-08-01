@@ -99,35 +99,57 @@ def _hsv_bg_color(img):
             "confidence": round(scores[best] / denom, 4)}
 
 
-def _hsv_font_color(img):
-    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, dark  = cv2.threshold(gray, 80,  255, cv2.THRESH_BINARY_INV)
-    _, light = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    total = img.shape[0] * img.shape[1]
-    masks = {
-        "black": dark,
-        "white": light,
+def _hsv_font_color(img, bg_color="white"):
+    hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    total = max(img.shape[0] * img.shape[1], 1)
+
+    bg_masks = {
+        "white": cv2.inRange(hsv, (0,  0,  180), (180, 40, 255)),
         "red":   cv2.bitwise_or(
-                     cv2.inRange(hsv, (0,  80, 60), (10,  255, 255)),
-                     cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))),
+                     cv2.inRange(hsv, (0,   100, 80), (12,  255, 255)),
+                     cv2.inRange(hsv, (165, 100, 80), (180, 255, 255))),
+        "green": cv2.inRange(hsv, (35, 60, 30), (90, 255, 200)),
     }
-    scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
-    best   = max(scores, key=scores.get)
-    denom  = sum(scores.values()) or 1
+    not_bg = cv2.bitwise_not(bg_masks.get(bg_color, bg_masks["white"]))
+
+    red_mask = cv2.bitwise_and(
+        cv2.bitwise_or(
+            cv2.inRange(hsv, (0,   100, 80), (12,  255, 255)),
+            cv2.inRange(hsv, (165, 100, 80), (180, 255, 255)),
+        ), not_bg)
+    white_mask = cv2.bitwise_and(
+        cv2.inRange(hsv, (0, 0, 200), (180, 35, 255)), not_bg)
+    black_mask = cv2.bitwise_and(
+        cv2.inRange(hsv, (0, 0, 0), (180, 100, 90)), not_bg)
+
+    scores = {
+        "red":   int(red_mask.sum()   / 255) / total,
+        "white": int(white_mask.sum() / 255) / total,
+        "black": int(black_mask.sum() / 255) / total,
+    }
+
+    if scores["red"] >= 0.015:
+        best = "red"
+    elif scores["white"] > scores["black"]:
+        best = "white"
+    else:
+        best = "black"
+
+    denom = sum(scores.values()) or 1
     return {"class_id": {"black": 0, "white": 1, "red": 2}[best],
             "color": best,
-            "confidence": round(scores[best] / denom, 4)}
+            "confidence": min(round(scores[best] / denom, 4), 0.99)}
 
 
 def _detect_blur(img):
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     status = "clear" if score > 100 else "blurry"
-    conf = float(1 / (1 + np.exp(-(score - 100) / 40)))
+    raw_conf = float(1 / (1 + np.exp(-(score - 100) / 80)))
+    conf = min(raw_conf, 0.99) if status == "clear" else min(1 - raw_conf + 0.01, 0.99)
     return {"class_id": 0 if status == "clear" else 1,
             "status": status,
-            "confidence": round(1 - conf if status == "blurry" else conf, 4),
+            "confidence": round(conf, 4),
             "laplacian_score": round(score, 2)}
 
 
@@ -202,10 +224,10 @@ class Pipeline:
             return _predict_tta(self.bg_model, crop, BG_COLOR_IDS)
         return _hsv_bg_color(crop)
 
-    def _classify_font(self, crop):
+    def _classify_font(self, crop, bg_color="white"):
         if self.font_model:
             return _predict_tta(self.font_model, crop, FONT_IDS)
-        return _hsv_font_color(crop)
+        return _hsv_font_color(crop, bg_color)
 
     def _extract_text(self, crop):
         if not self.ocr:
@@ -228,7 +250,7 @@ class Pipeline:
         t0 = time.time()
         blur  = self._classify_blur(crop)
         bg    = self._classify_bg(crop)
-        font  = self._classify_font(crop)
+        font  = self._classify_font(crop, bg_color=bg.get("color", "white"))
         vtype = _determine_vehicle_type(bg.get("color", ""),
                                          font.get("color", ""))
         ocr = self._extract_text(crop)

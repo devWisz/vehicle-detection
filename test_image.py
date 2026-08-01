@@ -46,9 +46,8 @@ def detect_blur(img):
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     status = "clear" if score > 100 else "blurry"
-    conf = float(1 / (1 + np.exp(-(score - 100) / 40)))
-    if status == "blurry":
-        conf = 1 - conf
+    raw_conf = float(1 / (1 + np.exp(-(score - 100) / 80)))
+    conf = min(raw_conf, 0.99) if status == "clear" else min(1 - raw_conf + 0.01, 0.99)
     return {
         "class_id": 0 if status == "clear" else 1,
         "status": status,
@@ -78,26 +77,52 @@ def detect_bg_color_hsv(img):
     }
 
 
-def detect_font_color_hsv(img):
-    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    _, dark  = cv2.threshold(gray, 80,  255, cv2.THRESH_BINARY_INV)
-    _, light = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-    total = img.shape[0] * img.shape[1]
-    masks = {
-        "black": dark,
-        "white": light,
+def detect_font_color_hsv(img, bg_color="white"):
+    hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    total = max(img.shape[0] * img.shape[1], 1)
+
+    # Build a mask of background pixels to EXCLUDE from text search
+    bg_masks = {
+        "white": cv2.inRange(hsv, (0,  0,  180), (180, 40, 255)),
         "red":   cv2.bitwise_or(
-                     cv2.inRange(hsv, (0,  80, 60), (10,  255, 255)),
-                     cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))),
+                     cv2.inRange(hsv, (0,   100, 80), (12,  255, 255)),
+                     cv2.inRange(hsv, (165, 100, 80), (180, 255, 255))),
+        "green": cv2.inRange(hsv, (35, 60, 30), (90, 255, 200)),
     }
-    scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
-    best   = max(scores, key=scores.get)
-    denom  = sum(scores.values()) or 1
+    bg_mask = bg_masks.get(bg_color, bg_masks["white"])
+    not_bg  = cv2.bitwise_not(bg_mask)
+
+    # Search for font color only in NON-background pixels
+    red_mask = cv2.bitwise_and(
+        cv2.bitwise_or(
+            cv2.inRange(hsv, (0,   100, 80), (12,  255, 255)),
+            cv2.inRange(hsv, (165, 100, 80), (180, 255, 255)),
+        ), not_bg)
+    white_mask = cv2.bitwise_and(
+        cv2.inRange(hsv, (0, 0, 200), (180, 35, 255)), not_bg)
+    black_mask = cv2.bitwise_and(
+        cv2.inRange(hsv, (0, 0, 0), (180, 100, 90)), not_bg)
+
+    scores = {
+        "red":   int(red_mask.sum()   / 255) / total,
+        "white": int(white_mask.sum() / 255) / total,
+        "black": int(black_mask.sum() / 255) / total,
+    }
+
+    # Priority: any color with a score above 0.5% of total pixels wins;
+    # for equal scores, red > white > black.
+    if scores["red"] >= 0.015:
+        best = "red"
+    elif scores["white"] > scores["black"]:
+        best = "white"
+    else:
+        best = "black"
+
+    denom = sum(scores.values()) or 1
     return {
         "class_id": {"black": 0, "white": 1, "red": 2}[best],
         "color": best,
-        "confidence": round(scores[best] / denom, 4),
+        "confidence": min(round(scores[best] / denom, 4), 0.99),
         "scores": {k: round(v, 4) for k, v in scores.items()},
     }
 
@@ -259,7 +284,7 @@ def run(image_path=IMAGE_PATH):
     print(f"    {bg['color'].upper()}  conf={bg['confidence']:.1%}")
 
     print("[3] Font Color (HSV)")
-    font = detect_font_color_hsv(img)
+    font = detect_font_color_hsv(img, bg_color=bg["color"])
     print(f"    {font['color'].upper()}  conf={font['confidence']:.1%}")
 
     print("[4] Vehicle Type")
