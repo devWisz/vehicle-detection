@@ -1,459 +1,336 @@
-"""
-Standalone Test Script — images/image.png
-=========================================
-Tests a single license plate image WITHOUT requiring YOLO.
-Works even before CNN models are trained.
-
-Pipeline:
-  1. Load images/image.png
-  2. Laplacian blur detection
-  3. HSV rule-based color classification (fallback)
-  4. EasyOCR text extraction
-  5. CNN inference (if models exist)
-  6. Print full JSON result
-  7. Save annotated image → images/test_result.png
-"""
-
 import cv2
-import numpy as np
 import json
-import time
 import sys
+import time
+import uuid
+import numpy as np
 from pathlib import Path
 from datetime import datetime
 
-# ── Optional CNN ──────────────────────────────────────────────────────────────
 try:
     import tensorflow as tf
     from tensorflow import keras
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
-    print("  [WARNING] TensorFlow not found — CNN inference will be skipped")
 
-# ── Optional EasyOCR ──────────────────────────────────────────────────────────
 try:
     import easyocr
     OCR_AVAILABLE = True
 except ImportError:
     OCR_AVAILABLE = False
-    print("  [WARNING] easyocr not found — OCR will be skipped")
 
-# =============================================================================
-# CONFIG
-# =============================================================================
+BASE_DIR     = Path(__file__).resolve().parent
+IMAGE_PATH   = BASE_DIR / "images" / "image.png"
+RESULTS_FILE = BASE_DIR / "detection_results.json"
 
-BASE_DIR  = Path(__file__).resolve().parent
-IMAGE_PATH = BASE_DIR / "images" / "image.png"
-OUTPUT_IMG = BASE_DIR / "images" / "test_result.png"
+BLUR_IDS     = {0: "clear",  1: "blurry"}
+BG_COLOR_IDS = {0: "white",  1: "red",   2: "green"}
+FONT_IDS     = {0: "black",  1: "white", 2: "red"}
+
+VEHICLE_RULES = {
+    ("white", "black"): {"id": 0, "name": "Public Vehicle"},
+    ("red",   "white"): {"id": 1, "name": "Private Vehicle"},
+    ("white", "red"):   {"id": 2, "name": "Government Vehicle"},
+    ("green", "white"): {"id": 3, "name": "Tourist Vehicle"},
+}
 
 MODEL_PATHS = {
-    'blur':  BASE_DIR / "blur_classifier_final.h5",
-    'color': BASE_DIR / "color_classifier_final.h5",
-    'font':  BASE_DIR / "font_classifier_final.h5",
+    "blur": BASE_DIR / "blur_classifier_final.keras",
+    "bg":   BASE_DIR / "bg_color_classifier_final.keras",
+    "font": BASE_DIR / "font_color_classifier_final.keras",
 }
 
-CLASS_MAPS = {
-    'blur':  {0: 'clear',  1: 'blurry'},
-    'color': {0: 'yellow', 1: 'white', 2: 'green'},
-    'font':  {0: 'black',  1: 'white', 2: 'red',   3: 'green'},
-}
 
-VEHICLE_TYPE = {
-    'yellow': 'Private Vehicle',
-    'white':  'Commercial / Government',
-    'green':  'Government Vehicle',
-}
-
-CNN_INPUT_SIZE = (224, 224)
-
-# =============================================================================
-# RULE-BASED CLASSIFIERS (fallback / cross-check)
-# =============================================================================
-
-def classify_blur_laplacian(image: np.ndarray,
-                             threshold: float = 80.0) -> dict:
-    """Blur detection via Laplacian variance."""
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    score = cv2.Laplacian(gray, cv2.CV_64F).var()
-    status = 'clear' if score > threshold else 'blurry'
-    # Confidence: sigmoid mapping around threshold
-    conf = 1.0 / (1.0 + np.exp(-(score - threshold) / 30.0))
-    if status == 'blurry':
-        conf = 1.0 - conf
+def detect_blur(img):
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    status = "clear" if score > 100 else "blurry"
+    conf = float(1 / (1 + np.exp(-(score - 100) / 40)))
+    if status == "blurry":
+        conf = 1 - conf
     return {
-        'status': status,
-        'confidence': round(float(conf), 4),
-        'laplacian_score': round(float(score), 2),
+        "class_id": 0 if status == "clear" else 1,
+        "status": status,
+        "confidence": round(conf, 4),
+        "laplacian_score": round(score, 2),
     }
 
 
-def classify_color_hsv(image: np.ndarray) -> dict:
-    """
-    Rule-based plate color classification using HSV histograms.
-    Handles yellow, white, and green Nepali plates.
-    """
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-
-    # Masks for each color range
+def detect_bg_color_hsv(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    total = img.shape[0] * img.shape[1]
     masks = {
-        # Yellow: Hue 15–40
-        'yellow': cv2.inRange(hsv, (15, 60, 60), (40, 255, 255)),
-        # White: low saturation, high value
-        'white':  cv2.inRange(hsv, (0, 0, 160), (180, 50, 255)),
-        # Green: Hue 40–90
-        'green':  cv2.inRange(hsv, (40, 60, 40), (90, 255, 200)),
+        "white": cv2.inRange(hsv, (0,  0,  170), (180, 45, 255)),
+        "red":   cv2.bitwise_or(
+                     cv2.inRange(hsv, (0,  80,  60), (10,  255, 255)),
+                     cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))),
+        "green": cv2.inRange(hsv, (35, 60,  30), (90,  255, 200)),
     }
-
-    total_pixels = image.shape[0] * image.shape[1]
-    scores = {c: int(m.sum() / 255) / max(total_pixels, 1)
-              for c, m in masks.items()}
-
-    best_color = max(scores, key=scores.get)
-    best_score = scores[best_color]
-
-    # Normalise scores to confidence
-    total = sum(scores.values()) or 1.0
-    confidence = best_score / total if total > 0 else 0.0
-
-    return {
-        'color': best_color,
-        'confidence': round(float(confidence), 4),
-        'scores': {k: round(v, 4) for k, v in scores.items()},
-        'vehicle_type': VEHICLE_TYPE.get(best_color, 'Unknown'),
-    }
-
-
-def classify_font_hsv(image: np.ndarray) -> dict:
-    """
-    Rule-based font color detection.
-    Focuses on text-sized dark/bright pixels.
-    """
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # Threshold to find text pixels (darker or brighter than background)
-    _, dark_mask  = cv2.threshold(gray, 80,  255, cv2.THRESH_BINARY_INV)
-    _, light_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-
-    masks = {
-        'black': dark_mask,
-        'white': light_mask,
-        'red':   cv2.inRange(hsv, (0, 80, 80), (15, 255, 255)),
-        'green': cv2.inRange(hsv, (40, 80, 40), (90, 255, 200)),
-    }
-
-    total = image.shape[0] * image.shape[1]
     scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
-    best_font = max(scores, key=scores.get)
-    best_score = scores[best_font]
-    denom = sum(scores.values()) or 1.0
-
+    best   = max(scores, key=scores.get)
+    denom  = sum(scores.values()) or 1
     return {
-        'color': best_font,
-        'confidence': round(float(best_score / denom), 4),
-        'scores': {k: round(v, 4) for k, v in scores.items()},
+        "class_id": {"white": 0, "red": 1, "green": 2}[best],
+        "color": best,
+        "confidence": round(scores[best] / denom, 4),
+        "scores": {k: round(v, 4) for k, v in scores.items()},
     }
 
 
-# =============================================================================
-# CNN INFERENCE
-# =============================================================================
+def detect_font_color_hsv(img):
+    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, dark  = cv2.threshold(gray, 80,  255, cv2.THRESH_BINARY_INV)
+    _, light = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    total = img.shape[0] * img.shape[1]
+    masks = {
+        "black": dark,
+        "white": light,
+        "red":   cv2.bitwise_or(
+                     cv2.inRange(hsv, (0,  80, 60), (10,  255, 255)),
+                     cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))),
+    }
+    scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
+    best   = max(scores, key=scores.get)
+    denom  = sum(scores.values()) or 1
+    return {
+        "class_id": {"black": 0, "white": 1, "red": 2}[best],
+        "color": best,
+        "confidence": round(scores[best] / denom, 4),
+        "scores": {k: round(v, 4) for k, v in scores.items()},
+    }
 
-def load_cnn_models() -> dict:
-    """Load available trained CNN models."""
+
+def determine_vehicle_type(bg_color, font_color):
+    return VEHICLE_RULES.get((bg_color, font_color), {"id": -1, "name": "Unknown"})
+
+
+def load_models():
     models = {}
     if not TF_AVAILABLE:
         return models
-
     for name, path in MODEL_PATHS.items():
-        # Also try .keras extension
-        keras_path = Path(str(path).replace('.h5', '.keras'))
-        load_path = keras_path if keras_path.exists() else path
-
-        if load_path.exists():
+        if path.exists():
             try:
-                models[name] = keras.models.load_model(str(load_path),
-                                                        compile=False)
-                print(f"  ✓ Loaded {name} model from {load_path.name}")
+                models[name] = keras.models.load_model(str(path), compile=False)
+                print(f"  ✓ {name} model loaded")
             except Exception as e:
-                print(f"  ✗ Failed to load {name} model: {e}")
+                print(f"  ✗ {name}: {e}")
         else:
-            print(f"  ⚠  {name} model not found ({load_path.name}) — "
-                  f"using rule-based fallback")
-
+            print(f"  ⚠ {name} model not found — using rule-based fallback")
     return models
 
 
-def preprocess_for_cnn(image: np.ndarray,
-                        size: tuple = CNN_INPUT_SIZE) -> np.ndarray:
-    """Resize, normalise [0,1], add batch dimension."""
-    resized = cv2.resize(image, size)
-    rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-    arr = rgb.astype('float32') / 255.0
-    return np.expand_dims(arr, axis=0)
+def preprocess(img, size=(224, 224)):
+    rgb = cv2.cvtColor(cv2.resize(img, size), cv2.COLOR_BGR2RGB)
+    return np.expand_dims(rgb.astype("float32") / 255.0, axis=0)
 
 
-def predict_cnn(model, image: np.ndarray, class_map: dict) -> dict:
-    """Run CNN inference with test-time augmentation (TTA × 4)."""
-    h, w = image.shape[:2]
-
-    # TTA: original + hflip + brightness up + brightness down
+def predict_cnn(model, img, id_map):
     variants = [
-        image,
-        cv2.flip(image, 1),
-        cv2.convertScaleAbs(image, alpha=1.15, beta=10),
-        cv2.convertScaleAbs(image, alpha=0.85, beta=-10),
+        img,
+        cv2.flip(img, 1),
+        cv2.convertScaleAbs(img, alpha=1.15, beta=10),
+        cv2.convertScaleAbs(img, alpha=0.85, beta=-10),
     ]
-
-    preds = []
-    for v in variants:
-        inp = preprocess_for_cnn(v)
-        p   = model.predict(inp, verbose=0)[0]
-        preds.append(p)
-
-    avg = np.mean(preds, axis=0)
-    cls = int(np.argmax(avg))
+    probs = np.mean([model.predict(preprocess(v), verbose=0)[0]
+                     for v in variants], axis=0)
+    cls = int(np.argmax(probs))
     return {
-        'label':      class_map[cls],
-        'confidence': round(float(np.max(avg)), 4),
-        'all_probs':  {class_map[i]: round(float(avg[i]), 4)
-                       for i in range(len(avg))},
+        "class_id": cls,
+        "label": id_map[cls],
+        "confidence": round(float(np.max(probs)), 4),
+        "all_probabilities": {id_map[i]: round(float(p), 4)
+                              for i, p in enumerate(probs)},
     }
 
 
-# =============================================================================
-# OCR
-# =============================================================================
-
-def extract_text_ocr(image: np.ndarray) -> dict:
-    """Extract plate text using EasyOCR."""
+def extract_text(img):
     if not OCR_AVAILABLE:
-        return {'text': '', 'confidence': 0.0, 'raw': []}
-
+        return {"text": "", "confidence": 0.0, "words": []}
     try:
-        reader = easyocr.Reader(['ne', 'en'], gpu=False, verbose=False)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-        # Enhance for OCR
+        reader = easyocr.Reader(["ne", "en"], gpu=False, verbose=False)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         _, thresh = cv2.threshold(gray, 0, 255,
                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
         results = reader.readtext(thresh)
-
-        valid = [(text.strip(), float(prob))
-                 for _, text, prob in results
-                 if prob > 0.2 and text.strip()]
-
+        valid = [(t.strip(), float(p)) for _, t, p in results
+                 if p > 0.2 and t.strip()]
         if not valid:
-            return {'text': '', 'confidence': 0.0, 'raw': []}
-
-        # Sort top-to-bottom, left-to-right
-        full_text = ' '.join(t for t, _ in valid)
-        avg_conf  = float(np.mean([p for _, p in valid]))
-
+            return {"text": "", "confidence": 0.0, "words": []}
         return {
-            'text':       full_text.strip(),
-            'confidence': round(avg_conf, 4),
-            'raw':        [{'word': t, 'conf': round(p, 4)} for t, p in valid],
+            "text": " ".join(t for t, _ in valid),
+            "confidence": round(float(np.mean([p for _, p in valid])), 4),
+            "words": [{"word": t, "confidence": round(p, 4)} for t, p in valid],
         }
     except Exception as e:
-        return {'text': '', 'confidence': 0.0, 'error': str(e)}
+        return {"text": "", "confidence": 0.0, "error": str(e)}
 
 
-# =============================================================================
-# ANNOTATED OUTPUT
-# =============================================================================
+def draw_result(img, result):
+    h, w = img.shape[:2]
+    panel = 360
+    canvas = np.full((max(h, 460), w + panel, 3), 25, dtype=np.uint8)
+    canvas[:h, :w] = img
+    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (0, 200, 60), 3)
 
-COLORS = {
-    'green':  (0, 200, 60),
-    'red':    (0, 50, 220),
-    'yellow': (0, 200, 200),
-    'blue':   (200, 100, 0),
-    'white':  (255, 255, 255),
-    'dark':   (20, 20, 20),
-}
+    vt = result["vehicle_type"]
+    VT_COLORS = {0: (0, 200, 60), 1: (0, 80, 200),
+                 2: (0, 180, 200), 3: (0, 200, 150)}
+    vt_color = VT_COLORS.get(vt["id"], (200, 200, 200))
 
+    def txt(s, y, color=(210, 210, 210), scale=0.52, bold=False):
+        cv2.putText(canvas, s, (w + 10, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, scale, color,
+                    2 if bold else 1, cv2.LINE_AA)
 
-def draw_annotated(image: np.ndarray, result: dict) -> np.ndarray:
-    """Draw a rich annotation panel on the image."""
-    h, w = image.shape[:2]
-    panel_w = 340
-    canvas = np.zeros((max(h, 420), w + panel_w, 3), dtype=np.uint8)
-    canvas[:h, :w] = image
+    y = 28
+    txt("PLATE ANALYSIS", y, (0, 210, 255), 0.68, True); y += 30
+    txt(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"), y, (140, 140, 140)); y += 28
 
-    # Panel background
-    canvas[:, w:] = (30, 30, 30)
+    txt("-- Vehicle Type --", y, (140, 140, 140)); y += 22
+    txt(vt["name"], y, vt_color, 0.62, True); y += 26
 
-    def put(text, y, color=(220, 220, 220), scale=0.55, thickness=1):
-        cv2.putText(canvas, text, (w + 10, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness,
-                    cv2.LINE_AA)
+    txt("-- Plate Background --", y, (140, 140, 140)); y += 22
+    bg = result["bg_color"]
+    txt(f"Color: {bg['color'].upper()}  [ID:{bg['class_id']}]", y, (255, 210, 60)); y += 20
+    txt(f"Conf : {bg['confidence']:.1%}", y); y += 26
 
-    y = 30
-    put("PLATE ANALYSIS", y, COLORS['yellow'], 0.7, 2);  y += 35
-    put(f"Time: {datetime.now().strftime('%H:%M:%S')}", y); y += 28
+    txt("-- Font Color --", y, (140, 140, 140)); y += 22
+    fc = result["font_color"]
+    txt(f"Color: {fc['color'].upper()}  [ID:{fc['class_id']}]", y, (255, 210, 60)); y += 20
+    txt(f"Conf : {fc['confidence']:.1%}", y); y += 26
 
-    # OCR
-    put("─── OCR ───", y, (150, 150, 150)); y += 25
-    ocr = result.get('ocr', {})
-    put(f"Text : {ocr.get('text', 'N/A')}", y, COLORS['green']); y += 22
-    put(f"Conf : {ocr.get('confidence', 0):.1%}", y); y += 30
+    txt("-- Blur Quality --", y, (140, 140, 140)); y += 22
+    bl = result["blur"]
+    bc = (0, 200, 60) if bl["status"] == "clear" else (0, 50, 220)
+    txt(f"Status: {bl['status'].upper()}  [ID:{bl['class_id']}]", y, bc); y += 20
+    txt(f"Lap Score: {bl['laplacian_score']:.1f}", y); y += 20
+    txt(f"Conf     : {bl['confidence']:.1%}", y); y += 26
 
-    # Blur
-    put("─── Blur Quality ───", y, (150, 150, 150)); y += 25
-    blur = result.get('blur', {})
-    b_color = COLORS['green'] if blur.get('status') == 'clear' else COLORS['red']
-    put(f"Status: {blur.get('status', 'N/A').upper()}", y, b_color); y += 22
-    put(f"Lap Score: {blur.get('laplacian_score', 0):.1f}", y); y += 22
-    put(f"Conf: {blur.get('confidence', 0):.1%}", y); y += 30
+    txt("-- OCR --", y, (140, 140, 140)); y += 22
+    ocr = result["ocr"]
+    txt(f"{ocr['text'] or 'N/A'}", y, (0, 220, 80), 0.58, True); y += 20
+    txt(f"Conf: {ocr['confidence']:.1%}", y); y += 26
 
-    # Color
-    put("─── Plate Color ───", y, (150, 150, 150)); y += 25
-    col = result.get('plate_color', {})
-    put(f"Color : {col.get('color', 'N/A').upper()}", y, COLORS['yellow']); y += 22
-    put(f"Type  : {col.get('vehicle_type', 'N/A')}", y); y += 22
-    put(f"Conf  : {col.get('confidence', 0):.1%}", y); y += 30
-
-    # Font
-    put("─── Font Color ───", y, (150, 150, 150)); y += 25
-    font = result.get('font_color', {})
-    put(f"Color : {font.get('color', 'N/A').upper()}", y, COLORS['yellow']); y += 22
-    put(f"Conf  : {font.get('confidence', 0):.1%}", y); y += 30
-
-    # CNN badge
-    cnn_used = result.get('cnn_models_used', [])
-    put("─── CNN Models ───", y, (150, 150, 150)); y += 25
-    if cnn_used:
-        put(f"Active: {', '.join(cnn_used)}", y, COLORS['green']); y += 22
-    else:
-        put("Using rule-based only", y, (180, 120, 80)); y += 22
-
-    # Border on original image
-    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), COLORS['green'], 3)
+    cnn = result["cnn_models_used"]
+    txt("-- CNN Models --", y, (140, 140, 140)); y += 22
+    txt(", ".join(cnn) if cnn else "rule-based only",
+        y, (0, 200, 60) if cnn else (180, 120, 60))
 
     return canvas
 
 
-# =============================================================================
-# MAIN
-# =============================================================================
+def load_results_db():
+    if RESULTS_FILE.exists() and RESULTS_FILE.stat().st_size > 0:
+        with open(RESULTS_FILE) as f:
+            try:
+                return json.load(f)
+            except Exception:
+                return []
+    return []
 
-def run_test(image_path: Path = IMAGE_PATH) -> dict:
-    """Full test pipeline on a single plate image."""
-    t_start = time.time()
 
-    print(f"\n{'=' * 60}")
-    print(f"  PLATE TEST: {image_path.name}")
-    print(f"{'=' * 60}\n")
+def save_results_db(db):
+    with open(RESULTS_FILE, "w") as f:
+        json.dump(db, f, indent=2, ensure_ascii=False)
 
-    # 1. Load image
-    if not image_path.exists():
-        print(f"  ✗ Image not found: {image_path}")
-        sys.exit(1)
+
+def run(image_path=IMAGE_PATH):
+    t0 = time.time()
+    print(f"\n{'='*55}")
+    print(f"  PLATE ANALYSIS: {Path(image_path).name}")
+    print(f"{'='*55}")
 
     img = cv2.imread(str(image_path))
     if img is None:
-        print(f"  ✗ Cannot read image: {image_path}")
+        print(f"  ERROR: Cannot read {image_path}")
         sys.exit(1)
+    print(f"  Size: {img.shape[1]}x{img.shape[0]} px\n")
 
-    print(f"  Image size: {img.shape[1]}×{img.shape[0]} px")
+    print("[1] Blur Detection")
+    blur = detect_blur(img)
+    print(f"    {blur['status'].upper()}  score={blur['laplacian_score']}  "
+          f"conf={blur['confidence']:.1%}")
 
-    # 2. Blur detection (rule-based)
-    print("\n  [1] Blur Detection (Laplacian)")
-    blur_result = classify_blur_laplacian(img)
-    print(f"      Status : {blur_result['status'].upper()}")
-    print(f"      Score  : {blur_result['laplacian_score']}")
-    print(f"      Conf   : {blur_result['confidence']:.1%}")
+    print("[2] Background Color (HSV)")
+    bg = detect_bg_color_hsv(img)
+    print(f"    {bg['color'].upper()}  conf={bg['confidence']:.1%}")
 
-    # 3. Color classification (rule-based)
-    print("\n  [2] Plate Color (HSV)")
-    color_result = classify_color_hsv(img)
-    print(f"      Color  : {color_result['color'].upper()}")
-    print(f"      Type   : {color_result['vehicle_type']}")
-    print(f"      Conf   : {color_result['confidence']:.1%}")
+    print("[3] Font Color (HSV)")
+    font = detect_font_color_hsv(img)
+    print(f"    {font['color'].upper()}  conf={font['confidence']:.1%}")
 
-    # 4. Font color (rule-based)
-    print("\n  [3] Font Color (HSV)")
-    font_result = classify_font_hsv(img)
-    print(f"      Color  : {font_result['color'].upper()}")
-    print(f"      Conf   : {font_result['confidence']:.1%}")
+    print("[4] Vehicle Type")
+    vtype = determine_vehicle_type(bg["color"], font["color"])
+    print(f"    ID={vtype['id']}  {vtype['name']}")
 
-    # 5. OCR
-    print("\n  [4] OCR (EasyOCR)")
-    ocr_result = extract_text_ocr(img)
-    if ocr_result['text']:
-        print(f"      Text   : {ocr_result['text']}")
-        print(f"      Conf   : {ocr_result['confidence']:.1%}")
-    else:
-        print("      No text detected (OCR not available or low confidence)")
+    print("[5] OCR")
+    ocr = extract_text(img)
+    print(f"    '{ocr['text']}'  conf={ocr['confidence']:.1%}")
 
-    # 6. CNN inference (if models are available)
-    print("\n  [5] CNN Inference")
-    cnn_models = load_cnn_models()
+    print("[6] CNN Inference")
+    models = load_models()
     cnn_used = []
 
-    if 'blur' in cnn_models:
-        cnn_blur = predict_cnn(cnn_models['blur'], img, CLASS_MAPS['blur'])
-        print(f"      CNN Blur  : {cnn_blur['label'].upper()} "
-              f"({cnn_blur['confidence']:.1%})")
-        blur_result['cnn'] = cnn_blur
-        cnn_used.append('blur')
+    if "blur" in models:
+        r = predict_cnn(models["blur"], img, BLUR_IDS)
+        blur.update({"class_id": r["class_id"], "status": r["label"],
+                     "confidence": r["confidence"],
+                     "all_probabilities": r["all_probabilities"]})
+        cnn_used.append("blur")
+        print(f"    CNN blur  -> {r['label']} ({r['confidence']:.1%})")
 
-    if 'color' in cnn_models:
-        cnn_color = predict_cnn(cnn_models['color'], img, CLASS_MAPS['color'])
-        print(f"      CNN Color : {cnn_color['label'].upper()} "
-              f"({cnn_color['confidence']:.1%})")
-        color_result['cnn'] = cnn_color
-        cnn_used.append('color')
+    if "bg" in models:
+        r = predict_cnn(models["bg"], img, BG_COLOR_IDS)
+        bg.update({"class_id": r["class_id"], "color": r["label"],
+                   "confidence": r["confidence"],
+                   "all_probabilities": r.get("all_probabilities")})
+        vtype = determine_vehicle_type(bg["color"], font["color"])
+        cnn_used.append("bg_color")
+        print(f"    CNN bg    -> {r['label']} ({r['confidence']:.1%})")
 
-    if 'font' in cnn_models:
-        cnn_font = predict_cnn(cnn_models['font'], img, CLASS_MAPS['font'])
-        print(f"      CNN Font  : {cnn_font['label'].upper()} "
-              f"({cnn_font['confidence']:.1%})")
-        font_result['cnn'] = cnn_font
-        cnn_used.append('font')
+    if "font" in models:
+        r = predict_cnn(models["font"], img, FONT_IDS)
+        font.update({"class_id": r["class_id"], "color": r["label"],
+                     "confidence": r["confidence"],
+                     "all_probabilities": r.get("all_probabilities")})
+        vtype = determine_vehicle_type(bg["color"], font["color"])
+        cnn_used.append("font_color")
+        print(f"    CNN font  -> {r['label']} ({r['confidence']:.1%})")
 
-    total_ms = (time.time() - t_start) * 1000
+    ms = round((time.time() - t0) * 1000, 1)
 
-    # 7. Assemble result
     result = {
-        'image':            str(image_path),
-        'datetime':         datetime.now().isoformat(),
-        'processing_ms':    round(total_ms, 1),
-        'blur':             blur_result,
-        'plate_color':      color_result,
-        'font_color':       font_result,
-        'ocr':              ocr_result,
-        'cnn_models_used':  cnn_used,
-        'summary': {
-            'plate_number':  ocr_result['text'],
-            'plate_color':   color_result['color'],
-            'vehicle_type':  color_result['vehicle_type'],
-            'font_color':    font_result['color'],
-            'quality':       blur_result['status'],
-            'is_readable':  (blur_result['status'] == 'clear'
-                              and blur_result['laplacian_score'] > 80),
-        }
+        "detection_id": str(uuid.uuid4()),
+        "timestamp": datetime.now().isoformat(),
+        "image": str(image_path),
+        "processing_ms": ms,
+        "vehicle_type": vtype,
+        "blur": blur,
+        "bg_color": bg,
+        "font_color": font,
+        "ocr": ocr,
+        "cnn_models_used": cnn_used,
+        "is_readable": blur["status"] == "clear" and blur["laplacian_score"] > 100,
     }
 
-    # 8. Print JSON summary
-    print(f"\n{'=' * 60}")
-    print("  RESULT (JSON)")
-    print(f"{'=' * 60}")
+    db = load_results_db()
+    db.append(result)
+    save_results_db(db)
+    print(f"\n  Saved to {RESULTS_FILE}  (total records: {len(db)})")
+
+    print(f"\n{'='*55}\n  RESULT\n{'='*55}")
     print(json.dumps(result, indent=2, ensure_ascii=False))
 
-    # 9. Annotate and save image
-    annotated = draw_annotated(img, result)
-    OUTPUT_IMG.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(OUTPUT_IMG), annotated)
-    print(f"\n  ✓ Annotated image saved: {OUTPUT_IMG}")
-    print(f"  ✓ Total time: {total_ms:.1f} ms\n")
-
+    out_path = Path(image_path).parent / "test_result.png"
+    cv2.imwrite(str(out_path), draw_result(img, result))
+    print(f"\n  Annotated: {out_path}")
+    print(f"  Total time: {ms} ms\n")
     return result
 
 
 if __name__ == "__main__":
-    # Allow overriding image path via CLI: python test_image.py path/to/image.png
-    img_path = Path(sys.argv[1]) if len(sys.argv) > 1 else IMAGE_PATH
-    run_test(img_path)
+    path = Path(sys.argv[1]) if len(sys.argv) > 1 else IMAGE_PATH
+    run(path)

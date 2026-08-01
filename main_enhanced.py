@@ -1,630 +1,343 @@
-"""
-ENHANCED VEHICLE & LICENSE PLATE DETECTION SYSTEM
-Integrates:
-  - YOLO for license plate detection
-  - CNN Blur Classifier (EfficientNetB0)
-  - CNN Color Classifier (MobileNetV2)
-  - CNN Font Color Classifier (ResNet50)
-  - EasyOCR for text extraction
-  
-Author: BATO-AI System
-Version: 2.0
-"""
-
 import cv2
 import json
 import time
+import uuid
 import numpy as np
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
-import easyocr
-import tensorflow as tf
-from tensorflow import keras
+from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
-# Import YOLO
+try:
+    import easyocr
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+
+try:
+    import tensorflow as tf
+    from tensorflow import keras
+    TF_AVAILABLE = True
+except ImportError:
+    TF_AVAILABLE = False
+
 try:
     from ultralytics import YOLO
+    YOLO_AVAILABLE = True
 except ImportError:
-    print("Error: ultralytics not installed. Install with: pip install ultralytics")
-    YOLO = None
+    YOLO_AVAILABLE = False
 
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
+BASE_DIR = Path(__file__).resolve().parent
+RESULTS_FILE = BASE_DIR / "detection_results.json"
 
-@dataclass
-class Config:
-    """Configuration for the detection system"""
-    BASE_DIR = Path(__file__).resolve().parent
-    
-    # Model paths
-    YOLO_MODEL = BASE_DIR / "license_plate.pt"
-    BLUR_MODEL = BASE_DIR / "blur_classifier_final.h5"
-    COLOR_MODEL = BASE_DIR / "color_classifier_final.h5"
-    FONT_MODEL = BASE_DIR / "font_classifier_final.h5"
-    
-    # Detection thresholds
-    YOLO_CONF = 0.3
-    BLUR_THRESHOLD = 100  # Laplacian variance threshold
-    MIN_CONFIDENCE = 0.75  # Combined confidence threshold
-    
-    # CNN input size
-    CNN_INPUT_SIZE = (224, 224)
-    
-    # OCR settings
-    OCR_LANGUAGES = ['ne', 'en']  # Nepali, English
-    OCR_CONFIDENCE = 0.3
-    
-    # Class mappings
-    BLUR_CLASSES = {0: 'clear', 1: 'blurry'}
-    COLOR_CLASSES = {0: 'yellow', 1: 'white', 2: 'green'}
-    FONT_CLASSES = {0: 'black', 1: 'white', 2: 'red', 3: 'green'}
-    
-    # Vehicle type mappings
-    VEHICLE_TYPE_MAP = {
-        'yellow': 'Private Vehicle (Two-wheeler/Four-wheeler)',
-        'white': 'Commercial Vehicle (Taxi/Bus)',
-        'green': 'Government Vehicle'
-    }
+BLUR_IDS     = {0: "clear",  1: "blurry"}
+BG_COLOR_IDS = {0: "white",  1: "red",   2: "green"}
+FONT_IDS     = {0: "black",  1: "white", 2: "red"}
 
-# ============================================================================
-# DATA STRUCTURES
-# ============================================================================
+VEHICLE_RULES = {
+    ("white", "black"): {"id": 0, "name": "Public Vehicle"},
+    ("red",   "white"): {"id": 1, "name": "Private Vehicle"},
+    ("white", "red"):   {"id": 2, "name": "Government Vehicle"},
+    ("green", "white"): {"id": 3, "name": "Tourist Vehicle"},
+}
+
 
 @dataclass
-class QualityMetrics:
-    """License plate quality metrics"""
-    blur_status: str
-    blur_confidence: float
-    laplacian_score: float
-    is_readable: bool
-    processing_time_ms: float
-
-@dataclass
-class ColorAnalysis:
-    """Plate color analysis results"""
-    plate_color: str
-    confidence: float
-    vehicle_type: str
-    is_private: bool
-    is_government: bool
-
-@dataclass
-class FontAnalysis:
-    """Font color analysis results"""
-    font_color: str
-    confidence: float
-    indicates_private: bool
-    legal_validity: str  # Based on color standards
-
-@dataclass
-class DetectionResult:
-    """Complete detection result for a single plate"""
-    detection_id: int
-    timestamp: int
-    datetime_str: str
-    
-    # Bounding box
-    bounding_box: Dict[str, int]
-    
-    # OCR
+class Detection:
+    detection_id: str
+    timestamp: str
+    image: str
+    bounding_box: Dict
     plate_number: str
     ocr_confidence: float
-    
-    # Quality
-    quality: QualityMetrics
-    
-    # Color
-    plate_color: ColorAnalysis
-    
-    # Font
-    font_color: FontAnalysis
-    
-    # Confidence scores
+    vehicle_type: Dict
+    blur: Dict
+    bg_color: Dict
+    font_color: Dict
     yolo_confidence: float
     combined_confidence: float
     is_reliable: bool
-    
-    # Metadata
-    processing_time_ms: float
+    is_readable: bool
+    processing_ms: float
+    cnn_models_used: List[str]
 
-# ============================================================================
-# PREPROCESSING MODULE
-# ============================================================================
 
-class LicensePlatePreprocessor:
-    """Advanced preprocessing for license plate images"""
-    
-    @staticmethod
-    def enhance_contrast(image: np.ndarray) -> np.ndarray:
-        """
-        CLAHE - Contrast Limited Adaptive Histogram Equalization
-        Improves text visibility
-        """
-        lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
-        l, a, b = cv2.split(lab)
-        
-        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
-        l = clahe.apply(l)
-        
-        enhanced = cv2.merge([l, a, b])
-        return cv2.cvtColor(enhanced, cv2.COLOR_LAB2BGR)
-    
-    @staticmethod
-    def denoise(image: np.ndarray) -> np.ndarray:
-        """
-        Non-local means denoising
-        Removes noise while preserving edges (text)
-        """
-        return cv2.fastNlMeansDenoisingColored(
-            image,
-            None,
-            h=10,
-            hForColorComponents=10,
-            templateWindowSize=7,
-            searchWindowSize=21
+def _preprocess(img, size=(224, 224)):
+    rgb = cv2.cvtColor(cv2.resize(img, size), cv2.COLOR_BGR2RGB)
+    return np.expand_dims(rgb.astype("float32") / 255.0, axis=0)
+
+
+def _predict_tta(model, img, id_map):
+    variants = [
+        img,
+        cv2.flip(img, 1),
+        cv2.convertScaleAbs(img, alpha=1.15, beta=10),
+        cv2.convertScaleAbs(img, alpha=0.85, beta=-10),
+    ]
+    probs = np.mean([model.predict(_preprocess(v), verbose=0)[0]
+                     for v in variants], axis=0)
+    cls = int(np.argmax(probs))
+    return {"class_id": cls, "label": id_map[cls],
+            "confidence": round(float(np.max(probs)), 4)}
+
+
+def _hsv_bg_color(img):
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    total = img.shape[0] * img.shape[1]
+    masks = {
+        "white": cv2.inRange(hsv, (0,  0,  170), (180, 45, 255)),
+        "red":   cv2.bitwise_or(
+                     cv2.inRange(hsv, (0,  80,  60), (10,  255, 255)),
+                     cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))),
+        "green": cv2.inRange(hsv, (35, 60,  30), (90,  255, 200)),
+    }
+    scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
+    best   = max(scores, key=scores.get)
+    denom  = sum(scores.values()) or 1
+    return {"class_id": {"white": 0, "red": 1, "green": 2}[best],
+            "color": best,
+            "confidence": round(scores[best] / denom, 4)}
+
+
+def _hsv_font_color(img):
+    hsv  = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    _, dark  = cv2.threshold(gray, 80,  255, cv2.THRESH_BINARY_INV)
+    _, light = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    total = img.shape[0] * img.shape[1]
+    masks = {
+        "black": dark,
+        "white": light,
+        "red":   cv2.bitwise_or(
+                     cv2.inRange(hsv, (0,  80, 60), (10,  255, 255)),
+                     cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))),
+    }
+    scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
+    best   = max(scores, key=scores.get)
+    denom  = sum(scores.values()) or 1
+    return {"class_id": {"black": 0, "white": 1, "red": 2}[best],
+            "color": best,
+            "confidence": round(scores[best] / denom, 4)}
+
+
+def _detect_blur(img):
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    status = "clear" if score > 100 else "blurry"
+    conf = float(1 / (1 + np.exp(-(score - 100) / 40)))
+    return {"class_id": 0 if status == "clear" else 1,
+            "status": status,
+            "confidence": round(1 - conf if status == "blurry" else conf, 4),
+            "laplacian_score": round(score, 2)}
+
+
+def _determine_vehicle_type(bg_color, font_color):
+    return VEHICLE_RULES.get((bg_color, font_color), {"id": -1, "name": "Unknown"})
+
+
+class Pipeline:
+    YOLO_MODEL   = BASE_DIR / "license_plate.pt"
+    BLUR_MODEL   = BASE_DIR / "blur_classifier_final.keras"
+    BG_MODEL     = BASE_DIR / "bg_color_classifier_final.keras"
+    FONT_MODEL   = BASE_DIR / "font_color_classifier_final.keras"
+    YOLO_CONF    = 0.3
+    MIN_CONF     = 0.70
+
+    def __init__(self):
+        print("Initializing pipeline...")
+        self.yolo = None
+        self.blur_model = self.bg_model = self.font_model = None
+        self.ocr = None
+        self._load_yolo()
+        self._load_cnns()
+        self._load_ocr()
+        print("Ready.\n")
+
+    def _load_yolo(self):
+        if not YOLO_AVAILABLE:
+            print("  ⚠ YOLO not installed"); return
+        if not self.YOLO_MODEL.exists():
+            print(f"  ⚠ YOLO model not found: {self.YOLO_MODEL}"); return
+        try:
+            self.yolo = YOLO(str(self.YOLO_MODEL))
+            print("  ✓ YOLO loaded")
+        except Exception as e:
+            print(f"  ✗ YOLO: {e}")
+
+    def _load_cnns(self):
+        if not TF_AVAILABLE:
+            print("  ⚠ TensorFlow not available"); return
+        for attr, path, label in [
+            ("blur_model", self.BLUR_MODEL, "blur"),
+            ("bg_model",   self.BG_MODEL,   "bg_color"),
+            ("font_model", self.FONT_MODEL, "font_color"),
+        ]:
+            if path.exists():
+                try:
+                    setattr(self, attr, keras.models.load_model(str(path), compile=False))
+                    print(f"  ✓ {label} model loaded")
+                except Exception as e:
+                    print(f"  ✗ {label}: {e}")
+            else:
+                print(f"  ⚠ {label} model not found — using rule-based fallback")
+
+    def _load_ocr(self):
+        if not OCR_AVAILABLE:
+            print("  ⚠ easyocr not installed"); return
+        try:
+            self.ocr = easyocr.Reader(["ne", "en"], gpu=False, verbose=False)
+            print("  ✓ OCR ready")
+        except Exception as e:
+            print(f"  ✗ OCR: {e}")
+
+    def _classify_blur(self, crop):
+        if self.blur_model:
+            r = _predict_tta(self.blur_model, crop, BLUR_IDS)
+            base = _detect_blur(crop)
+            return {**base, **r, "status": r["label"]}
+        return _detect_blur(crop)
+
+    def _classify_bg(self, crop):
+        if self.bg_model:
+            return _predict_tta(self.bg_model, crop, BG_COLOR_IDS)
+        return _hsv_bg_color(crop)
+
+    def _classify_font(self, crop):
+        if self.font_model:
+            return _predict_tta(self.font_model, crop, FONT_IDS)
+        return _hsv_font_color(crop)
+
+    def _extract_text(self, crop):
+        if not self.ocr:
+            return {"text": "", "confidence": 0.0}
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            _, thresh = cv2.threshold(gray, 0, 255,
+                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            results = self.ocr.readtext(thresh)
+            valid = [(t.strip(), float(p)) for _, t, p in results
+                     if p > 0.25 and t.strip()]
+            if not valid:
+                return {"text": "", "confidence": 0.0}
+            return {"text": " ".join(t for t, _ in valid),
+                    "confidence": round(float(np.mean([p for _, p in valid])), 4)}
+        except Exception:
+            return {"text": "", "confidence": 0.0}
+
+    def _process_crop(self, crop, yolo_conf, img_path, idx):
+        t0 = time.time()
+        blur  = self._classify_blur(crop)
+        bg    = self._classify_bg(crop)
+        font  = self._classify_font(crop)
+        vtype = _determine_vehicle_type(bg.get("color", ""),
+                                         font.get("color", ""))
+        ocr = self._extract_text(crop)
+
+        cnn_used = []
+        if self.blur_model: cnn_used.append("blur")
+        if self.bg_model:   cnn_used.append("bg_color")
+        if self.font_model: cnn_used.append("font_color")
+
+        combined = (
+            blur.get("confidence", 0) * 0.20 +
+            bg.get("confidence",   0) * 0.30 +
+            font.get("confidence", 0) * 0.20 +
+            yolo_conf                 * 0.30
         )
-    
-    @staticmethod
-    def calculate_blur_score(image: np.ndarray) -> float:
-        """
-        Laplacian variance method for blur detection
-        Higher variance = sharper/clearer image
-        Typically: > 100 = clear, < 50 = blurry
-        """
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
-        variance = laplacian.var()
-        return float(variance)
-    
-    @staticmethod
-    def preprocess_for_cnn(image: np.ndarray, 
-                          target_size: Tuple[int, int] = (224, 224)) -> np.ndarray:
-        """
-        Complete preprocessing pipeline for CNN inference
-        """
-        # Resize
-        resized = cv2.resize(image, target_size)
-        
-        # Enhance contrast
-        enhanced = LicensePlatePreprocessor.enhance_contrast(resized)
-        
-        # Denoise
-        denoised = LicensePlatePreprocessor.denoise(enhanced)
-        
-        # Normalize to [0, 1]
-        normalized = denoised.astype('float32') / 255.0
-        
-        return normalized
-    
-    @staticmethod
-    def extract_text_region_mask(image: np.ndarray) -> np.ndarray:
-        """
-        Extract binary mask of text regions
-        Useful for font color analysis
-        """
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        
-        # Thresholding
-        _, binary = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-        
-        # Morphological operations
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
-        morph = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
-        
-        return morph
 
-# ============================================================================
-# CNN INFERENCE MODULE
-# ============================================================================
+        return Detection(
+            detection_id=str(uuid.uuid4()),
+            timestamp=datetime.now().isoformat(),
+            image=str(img_path),
+            bounding_box={},
+            plate_number=ocr["text"],
+            ocr_confidence=ocr["confidence"],
+            vehicle_type=vtype,
+            blur=blur,
+            bg_color=bg,
+            font_color=font,
+            yolo_confidence=yolo_conf,
+            combined_confidence=round(combined, 4),
+            is_reliable=combined > self.MIN_CONF,
+            is_readable=(blur.get("status") == "clear"
+                         and blur.get("laplacian_score", 0) > 100),
+            processing_ms=round((time.time() - t0) * 1000, 1),
+            cnn_models_used=cnn_used,
+        )
 
-class CNNInference:
-    """Handle all CNN model inferences"""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.blur_model = None
-        self.color_model = None
-        self.font_model = None
-        self._load_models()
-    
-    def _load_models(self):
-        """Load all CNN models (with .keras fallback and graceful degradation)"""
-        print("Loading CNN Models...")
+    def process(self, image_path: str) -> Optional[List[Detection]]:
+        t0 = time.time()
+        path = Path(image_path)
+        if not path.is_absolute():
+            path = BASE_DIR / path
+        if not path.exists():
+            print(f"Image not found: {path}"); return None
 
-        def _try_load(h5_path):
-            """Try .keras first (new format), then .h5 (legacy)"""
-            keras_path = Path(str(h5_path).replace('.h5', '.keras'))
-            for p in [keras_path, h5_path]:
-                if p.exists():
-                    try:
-                        m = keras.models.load_model(str(p), compile=False)
-                        return m, p.name
-                    except Exception as e:
-                        print(f"    Error loading {p.name}: {e}")
-            return None, None
-
-        self.blur_model,  name = _try_load(self.config.BLUR_MODEL)
-        if self.blur_model:  print(f"  ✓ Blur Classifier loaded ({name})")
-        else:                print(f"  ⚠ Blur model not found — using Laplacian fallback")
-
-        self.color_model, name = _try_load(self.config.COLOR_MODEL)
-        if self.color_model: print(f"  ✓ Color Classifier loaded ({name})")
-        else:                print(f"  ⚠ Color model not found — using HSV fallback")
-
-        self.font_model,  name = _try_load(self.config.FONT_MODEL)
-        if self.font_model:  print(f"  ✓ Font Classifier loaded ({name})")
-        else:                print(f"  ⚠ Font model not found — using HSV fallback")
-    
-    def _hsv_color_fallback(self, image: np.ndarray) -> Dict:
-        """Rule-based HSV plate color when CNN model is unavailable"""
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        masks = {
-            'yellow': cv2.inRange(hsv, (15, 60, 60),  (40, 255, 255)),
-            'white':  cv2.inRange(hsv, (0,  0,  160), (180, 50, 255)),
-            'green':  cv2.inRange(hsv, (40, 60, 40),  (90, 255, 200)),
-        }
-        total = image.shape[0] * image.shape[1]
-        scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
-        best = max(scores, key=scores.get)
-        denom = sum(scores.values()) or 1.0
-        return {'color': best, 'confidence': round(scores[best] / denom, 4),
-                'vehicle_type': self.config.VEHICLE_TYPE_MAP.get(best, 'Unknown')}
-
-    def _hsv_font_fallback(self, image: np.ndarray) -> Dict:
-        """Rule-based HSV font color when CNN model is unavailable"""
-        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        _, dark  = cv2.threshold(gray, 80,  255, cv2.THRESH_BINARY_INV)
-        _, light = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
-        masks = {
-            'black': dark, 'white': light,
-            'red':   cv2.inRange(hsv, (0,  80, 80), (15, 255, 255)),
-            'green': cv2.inRange(hsv, (40, 80, 40), (90, 255, 200)),
-        }
-        total = image.shape[0] * image.shape[1]
-        scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
-        best = max(scores, key=scores.get)
-        denom = sum(scores.values()) or 1.0
-        return {'color': best, 'confidence': round(scores[best] / denom, 4),
-                'legal_validity': 'Rule-based estimate'}
-
-    def classify_blur_quality(self, cropped_plate: np.ndarray) -> Dict:
-        """Classify if plate is clear or blurry (CNN with Laplacian fallback)"""
-        # Always compute Laplacian score
-        gray = cv2.cvtColor(cropped_plate, cv2.COLOR_BGR2GRAY)
-        lap_score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
-
-        if self.blur_model is None:
-            status = 'clear' if lap_score > 80 else 'blurry'
-            conf = 1.0 / (1.0 + np.exp(-(lap_score - 80) / 30.0))
-            return {'quality': status, 'confidence': round(conf, 4),
-                    'laplacian_score': round(lap_score, 2)}
-        
-        try:
-            resized = cv2.resize(cropped_plate, (224, 224))
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            preprocessed = np.expand_dims(rgb.astype('float32') / 255.0, axis=0)
-            prediction = self.blur_model.predict(preprocessed, verbose=0)
-            blur_class = np.argmax(prediction[0])
-            blur_confidence = float(np.max(prediction[0]))
-            return {
-                'quality': self.config.BLUR_CLASSES[blur_class],
-                'confidence': blur_confidence,
-                'laplacian_score': round(lap_score, 2)
-            }
-        except Exception as e:
-            print(f"Error in blur classification: {e}")
-            return {'quality': 'unknown', 'confidence': 0.0, 'laplacian_score': 0.0}
-    
-    def classify_plate_color(self, cropped_plate: np.ndarray) -> Dict:
-        """Classify plate background color (CNN with HSV fallback)"""
-        if self.color_model is None:
-            return self._hsv_color_fallback(cropped_plate)
-        
-        try:
-            resized = cv2.resize(cropped_plate, (224, 224))
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            preprocessed = np.expand_dims(rgb.astype('float32') / 255.0, axis=0)
-            
-            prediction = self.color_model.predict(
-                preprocessed,
-                verbose=0
-            )
-            
-            color_class = np.argmax(prediction[0])
-            color_confidence = float(np.max(prediction[0]))
-            color_name = self.config.COLOR_CLASSES[color_class]
-            
-            return {
-                'color': color_name,
-                'confidence': color_confidence,
-                'vehicle_type': self.config.VEHICLE_TYPE_MAP.get(
-                    color_name, 'Unknown'
-                )
-            }
-        except Exception as e:
-            print(f"Error in color classification: {e}")
-            return {'color': 'unknown', 'confidence': 0.0, 'vehicle_type': 'unknown'}
-    
-    def classify_font_color(self, cropped_plate: np.ndarray) -> Dict:
-        """Classify font/text color (CNN with HSV fallback)"""
-        if self.font_model is None:
-            return self._hsv_font_fallback(cropped_plate)
-        
-        try:
-            resized = cv2.resize(cropped_plate, (224, 224))
-            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
-            preprocessed = np.expand_dims(rgb.astype('float32') / 255.0, axis=0)
-            
-            prediction = self.font_model.predict(
-                preprocessed,
-                verbose=0
-            )
-            
-            font_class = np.argmax(prediction[0])
-            font_confidence = float(np.max(prediction[0]))
-            font_name = self.config.FONT_CLASSES[font_class]
-            
-            # Legal validity based on font color
-            legal_mapping = {
-                'black': 'Legal - Private Vehicle',
-                'white': 'Legal - Government',
-                'red': 'Special - Emergency Services',
-                'green': 'Legal - Eco-friendly'
-            }
-            
-            return {
-                'color': font_name,
-                'confidence': font_confidence,
-                'legal_validity': legal_mapping.get(font_name, 'Unknown')
-            }
-        except Exception as e:
-            print(f"Error in font classification: {e}")
-            return {'color': 'unknown', 'confidence': 0.0, 'legal': 'unknown'}
-
-# ============================================================================
-# OCR MODULE
-# ============================================================================
-
-class OCRProcessor:
-    """Handle OCR processing"""
-    
-    def __init__(self, config: Config):
-        self.config = config
-        self.ocr_reader = easyocr.Reader(config.OCR_LANGUAGES)
-    
-    def extract_text(self, image: np.ndarray) -> Tuple[str, float]:
-        """
-        Extract text from license plate using EasyOCR
-        Returns: (extracted_text, average_confidence)
-        """
-        try:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            
-            results = self.ocr_reader.readtext(gray)
-            
-            if not results:
-                return "", 0.0
-            
-            # Filter by confidence threshold
-            valid_results = [
-                (text, prob) for _, text, prob in results 
-                if prob > self.config.OCR_CONFIDENCE
-            ]
-            
-            if not valid_results:
-                return "", 0.0
-            
-            extracted_text = " ".join([text for text, _ in valid_results])
-            avg_confidence = np.mean([prob for _, prob in valid_results])
-            
-            return extracted_text.strip(), float(avg_confidence)
-        
-        except Exception as e:
-            print(f"Error in OCR: {e}")
-            return "", 0.0
-
-# ============================================================================
-# MAIN DETECTION PIPELINE
-# ============================================================================
-
-class VehicleDetectionPipeline:
-    """Complete detection pipeline"""
-    
-    def __init__(self, config: Config = None):
-        self.config = config or Config()
-        
-        # Load YOLO model
-        if YOLO is None:
-            raise RuntimeError("YOLO model not available")
-        
-        print("Initializing Vehicle Detection Pipeline...")
-        self.detector = YOLO(str(self.config.YOLO_MODEL))
-        
-        # Initialize CNN inference
-        self.cnn_inference = CNNInference(self.config)
-        
-        # Initialize OCR
-        self.ocr_processor = OCRProcessor(self.config)
-        
-        print("✓ Pipeline initialized successfully\n")
-    
-    def process_vehicle_image(self, image_path: str) -> Optional[List[DetectionResult]]:
-        """
-        Main processing function for vehicle images
-        Returns list of DetectionResult objects
-        """
-        pipeline_start = time.time()
-        
-        # Load image
-        img_path = Path(image_path)
-        if not img_path.is_absolute():
-            img_path = self.config.BASE_DIR / img_path
-        
-        if not img_path.exists():
-            print(f"Error: Image not found at {img_path}")
-            return None
-        
-        frame = cv2.imread(str(img_path))
+        frame = cv2.imread(str(path))
         if frame is None:
-            print(f"Error: Could not load image at {img_path}")
-            return None
-        
-        print(f"Processing image: {img_path.name}")
-        print(f"Image size: {frame.shape}")
-        
-        # YOLO detection
-        yolo_start = time.time()
-        yolo_results = self.detector(frame, conf=self.config.YOLO_CONF)[0]
-        yolo_time = (time.time() - yolo_start) * 1000
-        
-        detected_vehicles = []
-        
-        for idx, box in enumerate(yolo_results.boxes):
-            detection_start = time.time()
-            
-            # Extract bounding box
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cropped_plate = frame[y1:y2, x1:x2]
-            
-            if cropped_plate.size == 0:
-                continue
-            
-            # ===== STAGE 1: Blur Quality =====
-            blur_info = self.cnn_inference.classify_blur_quality(cropped_plate)
-            
-            # ===== STAGE 2: Plate Color =====
-            color_info = self.cnn_inference.classify_plate_color(cropped_plate)
-            
-            # ===== STAGE 3: Font Color =====
-            font_info = self.cnn_inference.classify_font_color(cropped_plate)
-            
-            # ===== STAGE 4: Text Extraction =====
-            plate_text, ocr_conf = self.ocr_processor.extract_text(cropped_plate)
-            
-            # ===== STAGE 5: Confidence Scoring =====
-            combined_confidence = (
-                blur_info['confidence'] * 0.2 +
-                color_info['confidence'] * 0.25 +
-                font_info['confidence'] * 0.25 +
-                float(box.conf[0]) * 0.3
-            )
-            
-            # ===== STAGE 6: Build Result =====
-            quality_metrics = QualityMetrics(
-                blur_status=blur_info['quality'],
-                blur_confidence=blur_info['confidence'],
-                laplacian_score=blur_info['laplacian_score'],
-                is_readable=blur_info['quality'] == 'clear' and blur_info['laplacian_score'] > self.config.BLUR_THRESHOLD,
-                processing_time_ms=(time.time() - detection_start) * 1000
-            )
-            
-            color_analysis = ColorAnalysis(
-                plate_color=color_info['color'],
-                confidence=color_info['confidence'],
-                vehicle_type=color_info['vehicle_type'],
-                is_private='Private' in color_info['vehicle_type'],
-                is_government='Government' in color_info['vehicle_type']
-            )
-            
-            font_analysis = FontAnalysis(
-                font_color=font_info['color'],
-                confidence=font_info['confidence'],
-                indicates_private=font_info['color'] == 'black',
-                legal_validity=font_info['legal_validity']
-            )
-            
-            result = DetectionResult(
-                detection_id=idx + 1,
-                timestamp=int(time.time()),
-                datetime_str=datetime.now().isoformat(),
-                bounding_box={'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2},
-                plate_number=plate_text,
-                ocr_confidence=ocr_conf,
-                quality=quality_metrics,
-                plate_color=color_analysis,
-                font_color=font_analysis,
-                yolo_confidence=float(box.conf[0]),
-                combined_confidence=combined_confidence,
-                is_reliable=combined_confidence > self.config.MIN_CONFIDENCE,
-                processing_time_ms=(time.time() - detection_start) * 1000
-            )
-            
-            detected_vehicles.append(result)
-        
-        total_time = (time.time() - pipeline_start) * 1000
-        
-        print(f"\nDetection Summary:")
-        print(f"  Plates detected: {len(detected_vehicles)}")
-        print(f"  YOLO inference: {yolo_time:.2f}ms")
-        print(f"  Total processing: {total_time:.2f}ms")
-        
-        return detected_vehicles if detected_vehicles else None
-    
-    def results_to_json(self, results: List[DetectionResult], 
-                       indent: bool = True) -> str:
-        """Convert results to JSON"""
-        data = [asdict(result) for result in results]
-        indent_level = 2 if indent else None
-        return json.dumps(data, indent=indent_level, ensure_ascii=False)
-    
-    def save_results(self, results: List[DetectionResult], 
-                    output_path: str):
-        """Save results to JSON file"""
-        json_data = self.results_to_json(results)
-        
-        out_path = Path(output_path)
-        out_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(out_path, 'w', encoding='utf-8') as f:
-            f.write(json_data)
-        
-        print(f"Results saved to: {output_path}")
+            print(f"Cannot read: {path}"); return None
 
-# ============================================================================
-# MAIN EXECUTION
-# ============================================================================
+        print(f"Processing: {path.name}  ({frame.shape[1]}×{frame.shape[0]})")
+
+        if self.yolo is None:
+            print("  YOLO unavailable — treating full image as plate")
+            det = self._process_crop(frame, yolo_conf=0.5,
+                                     img_path=path, idx=0)
+            det.bounding_box = {"x1": 0, "y1": 0,
+                                 "x2": frame.shape[1], "y2": frame.shape[0]}
+            detections = [det]
+        else:
+            t_yolo = time.time()
+            results = self.yolo(frame, conf=self.YOLO_CONF)[0]
+            print(f"  YOLO: {len(results.boxes)} plate(s)  "
+                  f"({(time.time()-t_yolo)*1000:.0f}ms)")
+
+            detections = []
+            for i, box in enumerate(results.boxes):
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                crop = frame[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+                det = self._process_crop(
+                    crop, float(box.conf[0]), path, i)
+                det.bounding_box = {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+                detections.append(det)
+
+        if not detections:
+            print("  No plates detected"); return None
+
+        print(f"  Total: {(time.time()-t0)*1000:.0f}ms\n")
+        return detections
+
+    def save(self, detections: List[Detection]):
+        db = []
+        if RESULTS_FILE.exists() and RESULTS_FILE.stat().st_size > 0:
+            with open(RESULTS_FILE) as f:
+                try:
+                    db = json.load(f)
+                except Exception:
+                    db = []
+        for d in detections:
+            db.append(asdict(d))
+        with open(RESULTS_FILE, "w") as f:
+            json.dump(db, f, indent=2, ensure_ascii=False)
+        print(f"Saved {len(detections)} result(s) to {RESULTS_FILE} "
+              f"(total: {len(db)})")
+
 
 if __name__ == "__main__":
-    try:
-        # Initialize pipeline
-        pipeline = VehicleDetectionPipeline()
-        
-        # Process image
-        test_image = "images/image.png"
-        results = pipeline.process_vehicle_image(test_image)
-        
-        if results:
-            print("\n" + "="*60)
-            print("DETECTION RESULTS")
-            print("="*60)
-            
-            # Print to console
-            print(pipeline.results_to_json(results))
-            
-            # Save to file
-            pipeline.save_results(results, "detection_results.json")
-            
-            # Print summary
-            print("\n" + "="*60)
-            print("SUMMARY")
-            print("="*60)
-            for result in results:
-                print(f"\nDetection #{result.detection_id}:")
-                print(f"  Plate Number: {result.plate_number}")
-                print(f"  Color: {result.plate_color.plate_color} ({result.plate_color.vehicle_type})")
-                print(f"  Font Color: {result.font_color.font_color}")
-                print(f"  Quality: {result.quality.blur_status}")
-                print(f"  Readable: {'Yes' if result.quality.is_readable else 'No'}")
-                print(f"  Confidence: {result.combined_confidence:.2%}")
-                print(f"  Reliable: {'Yes' if result.is_reliable else 'No'}")
-        else:
-            print("No license plates detected")
-    
-    except Exception as e:
-        print(f"Error: {e}")
-        import traceback
-        traceback.print_exc()
+    pipeline = Pipeline()
+    detections = pipeline.process("images/image.png")
+
+    if detections:
+        for d in detections:
+            print(f"\n  Plate       : {d.plate_number or 'N/A'}")
+            print(f"  Vehicle Type: {d.vehicle_type['name']} (ID {d.vehicle_type['id']})")
+            print(f"  BG Color    : {d.bg_color.get('color', 'N/A')}")
+            print(f"  Font Color  : {d.font_color.get('color', 'N/A')}")
+            print(f"  Quality     : {d.blur.get('status', 'N/A')}")
+            print(f"  Confidence  : {d.combined_confidence:.1%}")
+            print(f"  Reliable    : {'Yes' if d.is_reliable else 'No'}")
+        pipeline.save(detections)
+    else:
+        print("No detections.")
