@@ -75,6 +75,7 @@ def _build_model(backbone, num_classes, input_shape=(224, 224, 3),
     x = layers.RandomContrast(0.2)(x)
 
     backbone.trainable = False
+    x = layers.Rescaling(scale=255.0)(x)
     x = backbone(x, training=False)
 
     x = SqueezeExcitation(ratio=16)(x)
@@ -102,23 +103,20 @@ def _build_model(backbone, num_classes, input_shape=(224, 224, 3),
 
 def build_blur_classifier(input_shape=(224, 224, 3)):
     bb = tf.keras.applications.EfficientNetB2(
-        input_shape=input_shape, include_top=False,
-        weights="imagenet", include_preprocessing=True)
+        input_shape=input_shape, include_top=False, weights="imagenet")
     return _build_model(bb, num_classes=2, input_shape=input_shape,
                         dropout=0.4, loss=focal_loss())
 
 
 def build_bg_color_classifier(input_shape=(224, 224, 3)):
     bb = tf.keras.applications.EfficientNetB0(
-        input_shape=input_shape, include_top=False,
-        weights="imagenet", include_preprocessing=True)
+        input_shape=input_shape, include_top=False, weights="imagenet")
     return _build_model(bb, num_classes=3, input_shape=input_shape, dropout=0.35)
 
 
 def build_font_color_classifier(input_shape=(224, 224, 3)):
     bb = tf.keras.applications.EfficientNetB1(
-        input_shape=input_shape, include_top=False,
-        weights="imagenet", include_preprocessing=True)
+        input_shape=input_shape, include_top=False, weights="imagenet")
     return _build_model(bb, num_classes=3, input_shape=input_shape, dropout=0.4)
 
 
