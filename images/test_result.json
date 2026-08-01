@@ -1,0 +1,70 @@
+{
+  "timestamp": "2026-08-01T19:00:31.093206",
+  "image": "/Users/sarjak.khanalgmail.com/Documents/vehicle-detection/images/image.png",
+  "processing_ms": 10215.9,
+  "enhanced": false,
+  "vehicle_type": {
+    "id": 0,
+    "name": "Public Vehicle"
+  },
+  "blur": {
+    "class_id": 0,
+    "status": "clear",
+    "confidence": 0.99,
+    "laplacian_score": 941.53
+  },
+  "bg_color": {
+    "class_id": 0,
+    "color": "white",
+    "confidence": 0.9177,
+    "scores": {
+      "red": 0.0183,
+      "green": 0.0,
+      "white": 0.2046
+    }
+  },
+  "font_color": {
+    "class_id": 0,
+    "color": "black",
+    "confidence": 0.7333,
+    "scores": {
+      "red": 0.0204,
+      "white": 0.0,
+      "black": 0.0561
+    }
+  },
+  "ocr": {
+    "text": "NEP A BAGMATI AB 1350",
+    "confidence": 0.7409,
+    "words": [
+      {
+        "word": "HEP",
+        "confidence": 0.8188
+      },
+      {
+        "word": "A",
+        "confidence": 0.2944
+      },
+      {
+        "word": "BAGMATI",
+        "confidence": 0.6321
+      },
+      {
+        "word": "AB",
+        "confidence": 0.9606
+      },
+      {
+        "word": "1350",
+        "confidence": 0.9983
+      }
+    ],
+    "script": "latin"
+  },
+  "cnn_models_used": [
+    "blur",
+    "bg_color",
+    "font_color",
+    "script_type"
+  ],
+  "is_readable": true
+}

@@ -1,0 +1,8 @@
+{
+  "model_name": "script_type_classifier",
+  "class_ids": {
+    "devanagari": 0,
+    "latin": 1
+  },
+  "description": "0=devanagari 1=latin (sorted alphabetically)"
+}

@@ -1,0 +1,31 @@
+{
+  "model_name": "blur_classifier",
+  "class_ids": {
+    "clear": 0,
+    "blurry": 1
+  },
+  "vehicle_type_rules": {
+    "white+black": {
+      "id": 0,
+      "name": "Public Vehicle"
+    },
+    "red+white": {
+      "id": 1,
+      "name": "Private Vehicle"
+    },
+    "white+red": {
+      "id": 2,
+      "name": "Government Vehicle"
+    },
+    "green+white": {
+      "id": 3,
+      "name": "Tourist Vehicle"
+    }
+  },
+  "input_shape": [
+    224,
+    224,
+    3
+  ],
+  "accuracy": 0.0
+}

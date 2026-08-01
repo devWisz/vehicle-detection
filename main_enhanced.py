@@ -15,9 +15,35 @@ except ImportError:
 try:
     import tensorflow as tf
     from tensorflow import keras
+    from tensorflow.keras import layers as _layers
     TF_AVAILABLE = True
 except ImportError:
     TF_AVAILABLE = False
+    _layers = None
+
+if TF_AVAILABLE:
+    @keras.utils.register_keras_serializable(package="vehicle_detection")
+    class SqueezeExcitation(_layers.Layer):
+        def __init__(self, ratio=16, **kwargs):
+            super().__init__(**kwargs)
+            self.ratio = ratio
+
+        def build(self, input_shape):
+            c = input_shape[-1]
+            self.gap = _layers.GlobalAveragePooling2D()
+            self.fc1 = _layers.Dense(max(c // self.ratio, 8), activation="relu")
+            self.fc2 = _layers.Dense(c, activation="sigmoid")
+            self.rsh = _layers.Reshape((1, 1, c))
+
+        def call(self, x):
+            se = self.gap(x)
+            se = self.fc1(se)
+            se = self.fc2(se)
+            se = self.rsh(se)
+            return x * se
+
+        def get_config(self):
+            return {**super().get_config(), "ratio": self.ratio}
 
 try:
     from ultralytics import YOLO
@@ -66,7 +92,6 @@ def _preprocess(img, size=(224, 224)):
 def _predict_tta(model, img, id_map):
     variants = [
         img,
-        cv2.flip(img, 1),
         cv2.convertScaleAbs(img, alpha=1.15, beta=10),
         cv2.convertScaleAbs(img, alpha=0.85, beta=-10),
     ]
@@ -78,23 +103,28 @@ def _predict_tta(model, img, id_map):
 
 
 def _hsv_bg_color(img):
-    hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    total = max(img.shape[0] * img.shape[1], 1)
+    h, w = img.shape[:2]
 
-    red = cv2.bitwise_or(
-        cv2.inRange(hsv, (0,   100, 70), (10,  255, 255)),
-        cv2.inRange(hsv, (165, 100, 70), (180, 255, 255)),
-    )
-    green = cv2.inRange(hsv, (38, 80, 40), (88, 255, 210))
-    white = cv2.bitwise_and(
-        cv2.inRange(hsv, (0, 0, 160), (180, 50, 255)),
-        cv2.bitwise_not(red),
-    )
-    scores = {
-        "red":   int(red.sum()   / 255) / total,
-        "green": int(green.sum() / 255) / total,
-        "white": int(white.sum() / 255) / total,
-    }
+    def _score(region):
+        hsv   = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        total = max(region.shape[0] * region.shape[1], 1)
+        red   = cv2.bitwise_or(
+            cv2.inRange(hsv, (0,   100, 70), (10,  255, 255)),
+            cv2.inRange(hsv, (165, 100, 70), (180, 255, 255)),
+        )
+        green = cv2.inRange(hsv, (38, 80, 40), (88, 255, 210))
+        white = cv2.bitwise_and(
+            cv2.inRange(hsv, (0, 0, 160), (180, 50, 255)),
+            cv2.bitwise_not(red),
+        )
+        return {"red":   int(red.sum()   / 255) / total,
+                "green": int(green.sum() / 255) / total,
+                "white": int(white.sum() / 255) / total}
+
+    scores_full  = _score(img)
+    scores_right = _score(img[:, int(w * 0.40):])
+    scores = (scores_right if max(scores_right.values()) > max(scores_full.values()) * 1.15
+              else scores_full)
     best  = max(scores, key=scores.get)
     denom = sum(scores.values()) or 1
     return {"class_id": {"white": 0, "red": 1, "green": 2}[best],
@@ -158,6 +188,56 @@ def _detect_blur(img):
             "laplacian_score": round(score, 2)}
 
 
+def locate_plate(img):
+    h, w  = img.shape[:2]
+    gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    # Only search in the lower 80% (plates are never at the very top)
+    roi_y0 = int(h * 0.20)
+    roi    = gray[roi_y0:, :]
+
+    # Threshold for bright regions (plates are lighter than car bodies)
+    _, bright = cv2.threshold(roi, 160, 255, cv2.THRESH_BINARY)
+
+    # Close gaps between characters
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 8))
+    closed = cv2.morphologyEx(bright, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+
+    candidates = []
+    min_area   = (h * w) * 0.01   # at least 1% of image
+    for cnt in contours:
+        x, y, cw, ch = cv2.boundingRect(cnt)
+        if ch == 0:
+            continue
+        aspect = cw / ch
+        area   = cw * ch
+        if 1.2 <= aspect <= 7.5 and area >= min_area:
+            # Absolute y in original image
+            abs_y = y + roi_y0
+            candidates.append((area, x, abs_y, cw, ch))
+
+    if candidates:
+        candidates.sort(reverse=True)        # biggest first
+        _, x, y, cw, ch = candidates[0]
+        pad = max(8, int(min(cw, ch) * 0.05))
+        x1  = max(0,  x - pad)
+        y1  = max(0,  y - pad)
+        x2  = min(w,  x + cw + pad)
+        y2  = min(h,  y + ch + pad)
+        return img[y1:y2, x1:x2], {"x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                                     "auto_detected": True}
+
+    # Fallback: centre-bottom strip
+    y1 = int(h * 0.50)
+    x1 = int(w * 0.10)
+    x2 = int(w * 0.90)
+    return img[y1:, x1:x2], {"x1": x1, "y1": y1, "x2": x2, "y2": h,
+                               "auto_detected": False}
+
+
 def _determine_vehicle_type(bg_color, font_color):
     return VEHICLE_RULES.get((bg_color, font_color), {"id": -1, "name": "Unknown"})
 
@@ -217,36 +297,98 @@ class Pipeline:
             print(f"  ! OCR: {e}")
 
     def _classify_blur(self, crop):
+        base = _detect_blur(crop)
         if self.blur_model:
             r = _predict_tta(self.blur_model, crop, BLUR_IDS)
-            base = _detect_blur(crop)
-            return {**base, "class_id": r["class_id"],
-                    "status": r["label"], "confidence": r["confidence"]}
-        return _detect_blur(crop)
+            if r["confidence"] >= 0.70:
+                return {**base, "class_id": r["class_id"],
+                        "status": r["label"], "confidence": r["confidence"]}
+        return base
 
     def _classify_bg(self, crop):
+        hsv_res = _hsv_bg_color(crop)
         if self.bg_model:
-            return _predict_tta(self.bg_model, crop, BG_COLOR_IDS)
-        return _hsv_bg_color(crop)
+            r = _predict_tta(self.bg_model, crop, BG_COLOR_IDS)
+            if r["confidence"] >= 0.70:
+                return {"class_id": r["class_id"], "color": r["label"], "confidence": r["confidence"]}
+        return hsv_res
 
     def _classify_font(self, crop, bg_color="white"):
+        hsv_res = _hsv_font_color(crop, bg_color)
         if self.font_model:
-            return _predict_tta(self.font_model, crop, FONT_IDS)
-        return _hsv_font_color(crop, bg_color)
+            r = _predict_tta(self.font_model, crop, FONT_IDS)
+            if r["confidence"] >= 0.70:
+                return {"class_id": r["class_id"], "color": r["label"], "confidence": r["confidence"]}
+        return hsv_res
+
+    def _preprocess_for_ocr(self, gray):
+        h, w = gray.shape
+        if h < 100:
+            scale = 100 / h
+            gray  = cv2.resize(gray, (int(w * scale), 100),
+                               interpolation=cv2.INTER_CUBIC)
+
+        # Sharpen before thresholding
+        blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=1)
+        sharp   = cv2.addWeighted(gray, 1.5, blurred, -0.5, 0)
+
+        # Pass 1: Otsu on sharpened
+        _, p1 = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Pass 2: Adaptive gaussian
+        p2 = cv2.adaptiveThreshold(sharp, 255,
+                                    cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                    cv2.THRESH_BINARY, 31, 8)
+
+        # Pass 3: CLAHE to fix uneven lighting, then Otsu
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        eq    = clahe.apply(gray)
+        _, p3 = cv2.threshold(eq, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+        # Pass 4: Inverted (dark background -> white background)
+        _, p4_raw = cv2.threshold(sharp, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        p4 = cv2.bitwise_not(p4_raw)
+
+        return [p1, p2, p3, p4]
 
     def _extract_text(self, crop):
         if not self.ocr:
             return {"text": "", "confidence": 0.0}
         try:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-            _, thresh = cv2.threshold(gray, 0, 255,
-                                      cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-            results = self.ocr.readtext(thresh)
-            valid = [(t.strip(), float(p)) for _, t, p in results
-                     if p > 0.25 and t.strip()]
+            variants = self._preprocess_for_ocr(gray)
+            
+            results = [self.ocr.readtext(v) for v in variants]
+            
+            # Pick variant with highest cumulative confidence
+            best = max(results, key=lambda rs: sum(p for _, _, p in rs if p > 0.20))
+            valid = [(t.strip(), float(p)) for _, t, p in best
+                     if p > 0.22 and t.strip()]
             if not valid:
                 return {"text": "", "confidence": 0.0}
-            return {"text": " ".join(t for t, _ in valid),
+                
+            text = " ".join(t for t, _ in valid)
+            
+            # Apply corrections depending on whether it contains Devanagari
+            if any(ord(c) > 127 for c in text):
+                DEV_CORRECTIONS = {
+                    "%": "प",  "NE": "ने", "8": "ट",  "$": "स",  "!": "ि",
+                    "@": "ा",  "#": "ी",  "&": "ु",  "*": "ू",  "(": "े",
+                    ")": "ै",  "0": "०",  "1": "१",  "2": "२",  "3": "३",
+                    "4": "४",  "5": "५",  "6": "६",  "7": "७",  "9": "९",
+                }
+                for wrong, right in DEV_CORRECTIONS.items():
+                    text = text.replace(wrong, right)
+            else:
+                LATIN_CORRECTIONS = {
+                    "HEP": "NEP",
+                    "BAGIAT": "BAGMATI",
+                    "BAGIATI": "BAGMATI",
+                }
+                for wrong, right in LATIN_CORRECTIONS.items():
+                    text = text.replace(wrong, right)
+                    
+            return {"text": text,
                     "confidence": round(float(np.mean([p for _, p in valid])), 4)}
         except Exception:
             return {"text": "", "confidence": 0.0}
@@ -306,10 +448,23 @@ class Pipeline:
         print(f"Processing: {path.name}  ({frame.shape[1]}x{frame.shape[0]})")
 
         if self.yolo is None:
-            print("  YOLO unavailable — treating full image as plate")
-            det = self._process_crop(frame, yolo_conf=0.5, img_path=path)
-            det.bounding_box = {"x1": 0, "y1": 0,
-                                 "x2": frame.shape[1], "y2": frame.shape[0]}
+            plate_crop, plate_box = locate_plate(frame)
+            if plate_box.get("auto_detected"):
+                b = plate_box
+                print(f"  YOLO unavailable — CV2 auto-detected plate at ({b['x1']},{b['y1']})–({b['x2']},{b['y2']})")
+                det = self._process_crop(plate_crop, yolo_conf=0.5, img_path=path)
+                det.bounding_box = b
+            else:
+                h_orig, w_orig = frame.shape[:2]
+                if w_orig > 800 or h_orig > 400:
+                    print("  YOLO unavailable — CV2 fallback to centre-bottom strip")
+                    det = self._process_crop(plate_crop, yolo_conf=0.5, img_path=path)
+                    det.bounding_box = plate_box
+                else:
+                    print("  YOLO unavailable — treating full image as plate")
+                    det = self._process_crop(frame, yolo_conf=0.5, img_path=path)
+                    det.bounding_box = {"x1": 0, "y1": 0,
+                                         "x2": frame.shape[1], "y2": frame.shape[0]}
             detections = [det]
         else:
             t_yolo   = time.time()
@@ -347,8 +502,19 @@ class Pipeline:
 
 if __name__ == "__main__":
     pipeline   = Pipeline()
-    detections = pipeline.process("images/image.png")
+    target_img = "images/image.png"
+    detections = pipeline.process(target_img)
     if detections:
         pipeline.print_results(detections)
+        
+        # Save automatically in a JSON file
+        import json
+        out_json = Path(target_img).parent / "test_result.json"
+        try:
+            with open(out_json, "w") as f:
+                json.dump([asdict(d) for d in detections], f, indent=2)
+            print(f"Saved results to JSON: {out_json}")
+        except Exception as e:
+            print(f"Error saving JSON to {out_json}: {e}")
     else:
         print("No detections.")

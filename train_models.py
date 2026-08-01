@@ -32,6 +32,7 @@ def setup_gpu():
           f"{len(tf.config.list_physical_devices('GPU')) > 0}")
 
 
+@keras.utils.register_keras_serializable(package="vehicle_detection")
 class SqueezeExcitation(layers.Layer):
     def __init__(self, ratio=16, **kwargs):
         super().__init__(**kwargs)
@@ -136,31 +137,57 @@ def _callbacks(name, phase):
     ]
 
 
-def _make_generators(train_dir, val_dir, test_dir, batch=32, size=(224, 224)):
-    aug = ImageDataGenerator(
-        rescale=1. / 255, rotation_range=20,
-        width_shift_range=0.2, height_shift_range=0.2,
-        shear_range=0.15, zoom_range=0.2,
-        horizontal_flip=True, brightness_range=[0.7, 1.3],
-        channel_shift_range=20.0, fill_mode="nearest")
+def _make_generators(train_dir, val_dir, test_dir, batch=32, size=(224, 224),
+                     heavy_aug=False):
+    if heavy_aug:
+        # Extra aggressive augmentation for blur classifier —
+        # simulates varied lighting, camera noise, motion artefacts
+        aug = ImageDataGenerator(
+            rescale=1. / 255,
+            rotation_range=25,
+            width_shift_range=0.25,
+            height_shift_range=0.25,
+            shear_range=0.20,
+            zoom_range=0.25,
+            horizontal_flip=True,
+            vertical_flip=False,
+            brightness_range=[0.55, 1.55],
+            channel_shift_range=30.0,
+            fill_mode="nearest",
+        )
+    else:
+        aug = ImageDataGenerator(
+            rescale=1. / 255,
+            rotation_range=20,
+            width_shift_range=0.20,
+            height_shift_range=0.20,
+            shear_range=0.15,
+            zoom_range=0.20,
+            horizontal_flip=True,
+            brightness_range=[0.70, 1.30],
+            channel_shift_range=20.0,
+            fill_mode="nearest",
+        )
     plain = ImageDataGenerator(rescale=1. / 255)
 
     kw = dict(target_size=size, batch_size=batch, class_mode="categorical")
-    tr = aug.flow_from_directory(str(train_dir), shuffle=True,  **kw)
-    va = plain.flow_from_directory(str(val_dir),  shuffle=False, **kw)
+    tr = aug.flow_from_directory(str(train_dir),  shuffle=True,  **kw)
+    va = plain.flow_from_directory(str(val_dir),   shuffle=False, **kw)
     te = (plain.flow_from_directory(str(test_dir), shuffle=False, **kw)
           if test_dir and Path(test_dir).exists() else None)
     return tr, va, te
 
 
 def train(name, model, backbone, train_dir, val_dir, test_dir=None,
-          epochs1=30, epochs2=20, batch=32, finetune_layers=30):
+          epochs1=30, epochs2=20, batch=32, finetune_layers=30,
+          heavy_aug=False, class_weight=None):
     print(f"\n{'='*55}\n  {name.upper()}\n{'='*55}")
 
     if not Path(train_dir).exists():
         print(f"  Missing: {train_dir}"); return
 
-    tr, va, te = _make_generators(train_dir, val_dir, test_dir, batch)
+    tr, va, te = _make_generators(train_dir, val_dir, test_dir, batch,
+                                   heavy_aug=heavy_aug)
     if tr.samples == 0:
         print(f"  No images in {train_dir}"); return
 
@@ -169,6 +196,7 @@ def train(name, model, backbone, train_dir, val_dir, test_dir=None,
 
     print(f"\n  Phase 1 — frozen backbone ({epochs1} epochs)")
     model.fit(tr, validation_data=va, epochs=epochs1,
+              class_weight=class_weight,
               callbacks=_callbacks(name, "phase1"), verbose=1)
 
     print(f"\n  Phase 2 — fine-tune top {finetune_layers} layers ({epochs2} epochs)")
@@ -177,8 +205,14 @@ def train(name, model, backbone, train_dir, val_dir, test_dir=None,
         layer.trainable = False
     model.compile(
         optimizer=keras.optimizers.AdamW(learning_rate=5e-5, weight_decay=1e-5),
-        loss=model.loss, metrics=model.metrics_names[1:])
+        loss=keras.losses.CategoricalCrossentropy(label_smoothing=0.1),
+        metrics=["accuracy",
+                 keras.metrics.AUC(name="auc"),
+                 keras.metrics.Precision(name="precision"),
+                 keras.metrics.Recall(name="recall")],
+    )
     model.fit(tr, validation_data=va, epochs=epochs2,
+              class_weight=class_weight,
               callbacks=_callbacks(name, "phase2"), verbose=1)
 
     if te and te.samples > 0:
@@ -241,26 +275,35 @@ def main():
     bg_model,    bg_bb    = build_bg_color_classifier()
     font_model,  font_bb  = build_font_color_classifier()
 
+    # Blur: class_weight gives extra weight to blurry images
+    # (they are harder to learn and more critical to get right)
+    blur_class_weight = {0: 1.0, 1: 1.4}   # 0=clear, 1=blurry
+
     train("blur_classifier",
           blur_model, blur_bb,
           train_dir="dataset/blur_quality/train",
           val_dir="dataset/blur_quality/val",
           test_dir="dataset/blur_quality/test",
-          epochs1=30, epochs2=15, finetune_layers=30)
+          epochs1=40, epochs2=20,
+          finetune_layers=35,
+          heavy_aug=True,
+          class_weight=blur_class_weight)
 
     train("bg_color_classifier",
           bg_model, bg_bb,
           train_dir="dataset/bg_color/train",
           val_dir="dataset/bg_color/val",
           test_dir="dataset/bg_color/test",
-          epochs1=30, epochs2=15, finetune_layers=25)
+          epochs1=30, epochs2=15,
+          finetune_layers=25)
 
     train("font_color_classifier",
           font_model, font_bb,
           train_dir="dataset/font_color/train",
           val_dir="dataset/font_color/val",
           test_dir="dataset/font_color/test",
-          epochs1=30, epochs2=15, finetune_layers=25)
+          epochs1=30, epochs2=15,
+          finetune_layers=25)
 
     print("\n" + "=" * 55)
     print("  TRAINING COMPLETE")
