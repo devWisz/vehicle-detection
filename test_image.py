@@ -1,8 +1,6 @@
 import cv2
-import json
 import sys
 import time
-import uuid
 import numpy as np
 from pathlib import Path
 from datetime import datetime
@@ -20,9 +18,8 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
-BASE_DIR     = Path(__file__).resolve().parent
-IMAGE_PATH   = BASE_DIR / "images" / "image.png"
-RESULTS_FILE = BASE_DIR / "detection_results.json"
+BASE_DIR   = Path(__file__).resolve().parent
+IMAGE_PATH = BASE_DIR / "images" / "image.png"
 
 BLUR_IDS     = {0: "clear",  1: "blurry"}
 BG_COLOR_IDS = {0: "white",  1: "red",   2: "green"}
@@ -46,8 +43,8 @@ def detect_blur(img):
     gray  = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     score = float(cv2.Laplacian(gray, cv2.CV_64F).var())
     status = "clear" if score > 100 else "blurry"
-    raw_conf = float(1 / (1 + np.exp(-(score - 100) / 80)))
-    conf = min(raw_conf, 0.99) if status == "clear" else min(1 - raw_conf + 0.01, 0.99)
+    raw = float(1 / (1 + np.exp(-(score - 100) / 80)))
+    conf = min(raw, 0.99) if status == "clear" else min(1 - raw + 0.01, 0.99)
     return {
         "class_id": 0 if status == "clear" else 1,
         "status": status,
@@ -56,62 +53,75 @@ def detect_blur(img):
     }
 
 
-def detect_bg_color_hsv(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    total = img.shape[0] * img.shape[1]
-    masks = {
-        "white": cv2.inRange(hsv, (0,  0,  170), (180, 45, 255)),
-        "red":   cv2.bitwise_or(
-                     cv2.inRange(hsv, (0,  80,  60), (10,  255, 255)),
-                     cv2.inRange(hsv, (170, 80, 60), (180, 255, 255))),
-        "green": cv2.inRange(hsv, (35, 60,  30), (90,  255, 200)),
+def detect_bg_color(img):
+    hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    total = max(img.shape[0] * img.shape[1], 1)
+
+    # Red plate: strong saturation in red hue band (handles hue wrap-around 0/180)
+    red = cv2.bitwise_or(
+        cv2.inRange(hsv, (0,   100, 70), (10,  255, 255)),
+        cv2.inRange(hsv, (165, 100, 70), (180, 255, 255)),
+    )
+    # Green plate: green hue, medium-high saturation
+    green = cv2.inRange(hsv, (38, 80, 40), (88, 255, 210))
+    # White plate: very low saturation, high value
+    white = cv2.inRange(hsv, (0, 0, 160), (180, 50, 255))
+    # Penalise white pixels that overlap with the red zone (avoid edge artifacts)
+    white = cv2.bitwise_and(white, cv2.bitwise_not(red))
+
+    scores = {
+        "red":   int(red.sum()   / 255) / total,
+        "green": int(green.sum() / 255) / total,
+        "white": int(white.sum() / 255) / total,
     }
-    scores = {c: int(m.sum() / 255) / max(total, 1) for c, m in masks.items()}
-    best   = max(scores, key=scores.get)
-    denom  = sum(scores.values()) or 1
+    best  = max(scores, key=scores.get)
+    denom = sum(scores.values()) or 1
     return {
         "class_id": {"white": 0, "red": 1, "green": 2}[best],
         "color": best,
-        "confidence": round(scores[best] / denom, 4),
+        "confidence": min(round(scores[best] / denom, 4), 0.99),
         "scores": {k: round(v, 4) for k, v in scores.items()},
     }
 
 
-def detect_font_color_hsv(img, bg_color="white"):
-    hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    total = max(img.shape[0] * img.shape[1], 1)
+def detect_font_color(img, bg_color="white"):
+    h = img.shape[0]
+    # Analyse only the central 70% of height where text lives.
+    # This avoids corner emblems (flags, seals) triggering false colour hits.
+    crop = img[int(h * 0.15):int(h * 0.85), :]
 
-    # Build a mask of background pixels to EXCLUDE from text search
+    hsv   = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    total = max(crop.shape[0] * crop.shape[1], 1)
+
     bg_masks = {
-        "white": cv2.inRange(hsv, (0,  0,  180), (180, 40, 255)),
+        "white": cv2.inRange(hsv, (0, 0, 160), (180, 50, 255)),
         "red":   cv2.bitwise_or(
-                     cv2.inRange(hsv, (0,   100, 80), (12,  255, 255)),
-                     cv2.inRange(hsv, (165, 100, 80), (180, 255, 255))),
-        "green": cv2.inRange(hsv, (35, 60, 30), (90, 255, 200)),
+                     cv2.inRange(hsv, (0,   100, 70), (10,  255, 255)),
+                     cv2.inRange(hsv, (165, 100, 70), (180, 255, 255))),
+        "green": cv2.inRange(hsv, (38, 80, 40), (88, 255, 210)),
     }
-    bg_mask = bg_masks.get(bg_color, bg_masks["white"])
-    not_bg  = cv2.bitwise_not(bg_mask)
+    not_bg = cv2.bitwise_not(bg_masks.get(bg_color, bg_masks["white"]))
 
-    # Search for font color only in NON-background pixels
-    red_mask = cv2.bitwise_and(
+    red_font = cv2.bitwise_and(
         cv2.bitwise_or(
-            cv2.inRange(hsv, (0,   100, 80), (12,  255, 255)),
-            cv2.inRange(hsv, (165, 100, 80), (180, 255, 255)),
+            cv2.inRange(hsv, (0,   100, 70), (10,  255, 255)),
+            cv2.inRange(hsv, (165, 100, 70), (180, 255, 255)),
         ), not_bg)
-    white_mask = cv2.bitwise_and(
-        cv2.inRange(hsv, (0, 0, 200), (180, 35, 255)), not_bg)
-    black_mask = cv2.bitwise_and(
-        cv2.inRange(hsv, (0, 0, 0), (180, 100, 90)), not_bg)
+    white_font = cv2.bitwise_and(
+        cv2.inRange(hsv, (0, 0, 190), (180, 40, 255)), not_bg)
+    black_font = cv2.bitwise_and(
+        cv2.inRange(hsv, (0, 0, 0), (180, 80, 80)), not_bg)
 
     scores = {
-        "red":   int(red_mask.sum()   / 255) / total,
-        "white": int(white_mask.sum() / 255) / total,
-        "black": int(black_mask.sum() / 255) / total,
+        "red":   int(red_font.sum()   / 255) / total,
+        "white": int(white_font.sum() / 255) / total,
+        "black": int(black_font.sum() / 255) / total,
     }
 
-    # Priority: any color with a score above 0.5% of total pixels wins;
-    # for equal scores, red > white > black.
-    if scores["red"] >= 0.015:
+    # Red font needs >= 3% of the text-zone pixels to confirm.
+    # Government plates have red text across the full width — easily ≥3%.
+    # Corner emblems (flags) are much smaller and won't exceed this.
+    if scores["red"] >= 0.03:
         best = "red"
     elif scores["white"] > scores["black"]:
         best = "white"
@@ -139,11 +149,11 @@ def load_models():
         if path.exists():
             try:
                 models[name] = keras.models.load_model(str(path), compile=False)
-                print(f"  ✓ {name} model loaded")
+                print(f"  + {name} model loaded")
             except Exception as e:
-                print(f"  ✗ {name}: {e}")
+                print(f"  ! {name}: {e}")
         else:
-            print(f"  ⚠ {name} model not found — using rule-based fallback")
+            print(f"  - {name}: not found, using rule-based fallback")
     return models
 
 
@@ -165,7 +175,7 @@ def predict_cnn(model, img, id_map):
     return {
         "class_id": cls,
         "label": id_map[cls],
-        "confidence": round(float(np.max(probs)), 4),
+        "confidence": min(round(float(np.max(probs)), 4), 0.99),
         "all_probabilities": {id_map[i]: round(float(p), 4)
                               for i, p in enumerate(probs)},
     }
@@ -181,7 +191,7 @@ def extract_text(img):
                                   cv2.THRESH_BINARY + cv2.THRESH_OTSU)
         results = reader.readtext(thresh)
         valid = [(t.strip(), float(p)) for _, t, p in results
-                 if p > 0.2 and t.strip()]
+                 if p > 0.25 and t.strip()]
         if not valid:
             return {"text": "", "confidence": 0.0, "words": []}
         return {
@@ -195,71 +205,63 @@ def extract_text(img):
 
 def draw_result(img, result):
     h, w = img.shape[:2]
-    panel = 360
-    canvas = np.full((max(h, 460), w + panel, 3), 25, dtype=np.uint8)
+    panel = 370
+    canvas = np.full((max(h, 480), w + panel, 3), 18, dtype=np.uint8)
     canvas[:h, :w] = img
-    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), (0, 200, 60), 3)
 
     vt = result["vehicle_type"]
-    VT_COLORS = {0: (0, 200, 60), 1: (0, 80, 200),
-                 2: (0, 180, 200), 3: (0, 200, 150)}
-    vt_color = VT_COLORS.get(vt["id"], (200, 200, 200))
+    VT_COLORS = {
+        0: (60,  200, 60),   # Public   — green
+        1: (50,  100, 220),  # Private  — blue
+        2: (0,   190, 200),  # Govt     — cyan
+        3: (50,  200, 150),  # Tourist  — teal
+    }
+    vt_color = VT_COLORS.get(vt["id"], (180, 180, 180))
+    cv2.rectangle(canvas, (0, 0), (w - 1, h - 1), vt_color, 3)
 
     def txt(s, y, color=(210, 210, 210), scale=0.52, bold=False):
-        cv2.putText(canvas, s, (w + 10, y),
+        cv2.putText(canvas, str(s), (w + 10, y),
                     cv2.FONT_HERSHEY_SIMPLEX, scale, color,
                     2 if bold else 1, cv2.LINE_AA)
 
-    y = 28
-    txt("PLATE ANALYSIS", y, (0, 210, 255), 0.68, True); y += 30
-    txt(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"), y, (140, 140, 140)); y += 28
+    y = 30
+    txt("PLATE ANALYSIS", y, (0, 210, 255), 0.7, True);  y += 32
+    txt(datetime.now().strftime("%Y-%m-%d  %H:%M:%S"), y, (110, 110, 110)); y += 30
 
-    txt("-- Vehicle Type --", y, (140, 140, 140)); y += 22
-    txt(vt["name"], y, vt_color, 0.62, True); y += 26
+    txt("Vehicle Type", y, (150, 150, 150), 0.48); y += 20
+    txt(vt["name"], y, vt_color, 0.65, True);      y += 28
 
-    txt("-- Plate Background --", y, (140, 140, 140)); y += 22
+    txt("Plate Background", y, (150, 150, 150), 0.48); y += 20
     bg = result["bg_color"]
-    txt(f"Color: {bg['color'].upper()}  [ID:{bg['class_id']}]", y, (255, 210, 60)); y += 20
-    txt(f"Conf : {bg['confidence']:.1%}", y); y += 26
+    txt(f'{bg["color"].upper()}  [ID {bg["class_id"]}]', y, (255, 200, 50)); y += 20
+    txt(f'Confidence: {bg["confidence"]:.1%}', y); y += 28
 
-    txt("-- Font Color --", y, (140, 140, 140)); y += 22
+    txt("Font Color", y, (150, 150, 150), 0.48); y += 20
     fc = result["font_color"]
-    txt(f"Color: {fc['color'].upper()}  [ID:{fc['class_id']}]", y, (255, 210, 60)); y += 20
-    txt(f"Conf : {fc['confidence']:.1%}", y); y += 26
+    txt(f'{fc["color"].upper()}  [ID {fc["class_id"]}]', y, (255, 200, 50)); y += 20
+    txt(f'Confidence: {fc["confidence"]:.1%}', y); y += 28
 
-    txt("-- Blur Quality --", y, (140, 140, 140)); y += 22
+    txt("Blur Quality", y, (150, 150, 150), 0.48); y += 20
     bl = result["blur"]
-    bc = (0, 200, 60) if bl["status"] == "clear" else (0, 50, 220)
-    txt(f"Status: {bl['status'].upper()}  [ID:{bl['class_id']}]", y, bc); y += 20
-    txt(f"Lap Score: {bl['laplacian_score']:.1f}", y); y += 20
-    txt(f"Conf     : {bl['confidence']:.1%}", y); y += 26
+    bc = (60, 200, 60) if bl["status"] == "clear" else (50, 50, 220)
+    txt(f'{bl["status"].upper()}  [ID {bl["class_id"]}]', y, bc); y += 20
+    txt(f'Laplacian: {bl["laplacian_score"]}  Conf: {bl["confidence"]:.1%}', y); y += 28
 
-    txt("-- OCR --", y, (140, 140, 140)); y += 22
+    txt("OCR", y, (150, 150, 150), 0.48); y += 20
     ocr = result["ocr"]
-    txt(f"{ocr['text'] or 'N/A'}", y, (0, 220, 80), 0.58, True); y += 20
-    txt(f"Conf: {ocr['confidence']:.1%}", y); y += 26
+    plate_txt = ocr["text"] or "N/A"
+    # Truncate long text to fit panel
+    if len(plate_txt) > 22:
+        plate_txt = plate_txt[:22] + "..."
+    txt(plate_txt, y, (60, 220, 80), 0.6, True); y += 20
+    txt(f'Confidence: {ocr["confidence"]:.1%}', y); y += 28
 
     cnn = result["cnn_models_used"]
-    txt("-- CNN Models --", y, (140, 140, 140)); y += 22
-    txt(", ".join(cnn) if cnn else "rule-based only",
-        y, (0, 200, 60) if cnn else (180, 120, 60))
+    txt("CNN Models", y, (150, 150, 150), 0.48); y += 20
+    txt(", ".join(cnn) if cnn else "rule-based fallback",
+        y, (60, 200, 60) if cnn else (160, 110, 50))
 
     return canvas
-
-
-def load_results_db():
-    if RESULTS_FILE.exists() and RESULTS_FILE.stat().st_size > 0:
-        with open(RESULTS_FILE) as f:
-            try:
-                return json.load(f)
-            except Exception:
-                return []
-    return []
-
-
-def save_results_db(db):
-    with open(RESULTS_FILE, "w") as f:
-        json.dump(db, f, indent=2, ensure_ascii=False)
 
 
 def run(image_path=IMAGE_PATH):
@@ -270,22 +272,22 @@ def run(image_path=IMAGE_PATH):
 
     img = cv2.imread(str(image_path))
     if img is None:
-        print(f"  ERROR: Cannot read {image_path}")
-        sys.exit(1)
+        print(f"  ERROR: Cannot read {image_path}"); sys.exit(1)
     print(f"  Size: {img.shape[1]}x{img.shape[0]} px\n")
 
-    print("[1] Blur Detection")
+    print("[1] Blur Quality")
     blur = detect_blur(img)
-    print(f"    {blur['status'].upper()}  score={blur['laplacian_score']}  "
-          f"conf={blur['confidence']:.1%}")
+    print(f"    {blur['status'].upper()}  score={blur['laplacian_score']}  conf={blur['confidence']:.1%}")
 
-    print("[2] Background Color (HSV)")
-    bg = detect_bg_color_hsv(img)
+    print("[2] Plate Background Color")
+    bg = detect_bg_color(img)
     print(f"    {bg['color'].upper()}  conf={bg['confidence']:.1%}")
+    print(f"    scores: {bg['scores']}")
 
-    print("[3] Font Color (HSV)")
-    font = detect_font_color_hsv(img, bg_color=bg["color"])
+    print("[3] Font Color")
+    font = detect_font_color(img, bg_color=bg["color"])
     print(f"    {font['color'].upper()}  conf={font['confidence']:.1%}")
+    print(f"    scores: {font['scores']}")
 
     print("[4] Vehicle Type")
     vtype = determine_vehicle_type(bg["color"], font["color"])
@@ -311,7 +313,7 @@ def run(image_path=IMAGE_PATH):
         r = predict_cnn(models["bg"], img, BG_COLOR_IDS)
         bg.update({"class_id": r["class_id"], "color": r["label"],
                    "confidence": r["confidence"],
-                   "all_probabilities": r.get("all_probabilities")})
+                   "all_probabilities": r["all_probabilities"]})
         vtype = determine_vehicle_type(bg["color"], font["color"])
         cnn_used.append("bg_color")
         print(f"    CNN bg    -> {r['label']} ({r['confidence']:.1%})")
@@ -320,7 +322,7 @@ def run(image_path=IMAGE_PATH):
         r = predict_cnn(models["font"], img, FONT_IDS)
         font.update({"class_id": r["class_id"], "color": r["label"],
                      "confidence": r["confidence"],
-                     "all_probabilities": r.get("all_probabilities")})
+                     "all_probabilities": r["all_probabilities"]})
         vtype = determine_vehicle_type(bg["color"], font["color"])
         cnn_used.append("font_color")
         print(f"    CNN font  -> {r['label']} ({r['confidence']:.1%})")
@@ -328,7 +330,6 @@ def run(image_path=IMAGE_PATH):
     ms = round((time.time() - t0) * 1000, 1)
 
     result = {
-        "detection_id": str(uuid.uuid4()),
         "timestamp": datetime.now().isoformat(),
         "image": str(image_path),
         "processing_ms": ms,
@@ -341,17 +342,18 @@ def run(image_path=IMAGE_PATH):
         "is_readable": blur["status"] == "clear" and blur["laplacian_score"] > 100,
     }
 
-    db = load_results_db()
-    db.append(result)
-    save_results_db(db)
-    print(f"\n  Saved to {RESULTS_FILE}  (total records: {len(db)})")
-
     print(f"\n{'='*55}\n  RESULT\n{'='*55}")
-    print(json.dumps(result, indent=2, ensure_ascii=False))
+    for k, v in result.items():
+        if k not in ("blur", "bg_color", "font_color", "ocr"):
+            print(f"  {k}: {v}")
+    print(f"  blur:       {blur['status']} (conf {blur['confidence']:.1%})")
+    print(f"  bg_color:   {bg['color']} (conf {bg['confidence']:.1%})")
+    print(f"  font_color: {font['color']} (conf {font['confidence']:.1%})")
+    print(f"  ocr:        '{ocr['text']}' (conf {ocr['confidence']:.1%})")
 
     out_path = Path(image_path).parent / "test_result.png"
     cv2.imwrite(str(out_path), draw_result(img, result))
-    print(f"\n  Annotated: {out_path}")
+    print(f"\n  Annotated image: {out_path}")
     print(f"  Total time: {ms} ms\n")
     return result
 
