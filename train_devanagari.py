@@ -1,20 +1,3 @@
-"""
-train_devanagari.py
-====================
-Dedicated Devanagari / Nepali licence-plate training pipeline.
-
-What it does
-------------
-1. Generates a large Devanagari-only synthetic dataset
-   (1 500 plates per class, all 4 vehicle types, with realistic blur/noise)
-2. Fine-tunes the existing bg_color and font_color CNN models on that data
-3. Trains a lightweight script_type classifier: 0=Latin, 1=Devanagari
-   (used at inference to route OCR to the right language path)
-
-Run
----
-    python train_devanagari.py
-"""
 
 import os, random, json
 import numpy as np

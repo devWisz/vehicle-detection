@@ -1,7 +1,7 @@
 {
-  "timestamp": "2026-08-01T19:00:31.093206",
+  "timestamp": "2026-08-01T21:51:02.972938",
   "image": "/Users/sarjak.khanalgmail.com/Documents/vehicle-detection/images/image.png",
-  "processing_ms": 10215.9,
+  "processing_ms": 10178.0,
   "enhanced": false,
   "vehicle_type": {
     "id": 0,
