@@ -178,16 +178,3 @@ Every detection run appends to `detection_results.json`:
 ```
 
 ---
-
-## File Overview
-
-| File | Purpose |
-|---|---|
-| `data_preparation.py` | Generate synthetic dataset |
-| `train_models.py` | Train 3 CNN classifiers |
-| `test_image.py` | Test a single plate image |
-| `main_enhanced.py` | Full YOLO + CNN + OCR pipeline |
-| `dataset/` | Generated training data (gitignored) |
-| `detection_results.json` | Cumulative JSON results database |
-| `images/image.png` | Sample Nepali plate image |
-| `images/test_result.png` | Annotated detection output |
